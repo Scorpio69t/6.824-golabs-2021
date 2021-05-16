@@ -91,35 +91,41 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	return &c
 }
 
-func (c *Coordinator) AskForTask(noArgs *interface{}, t *MRTask) error {
+func (c *Coordinator) AskForTask(args *AskForTaskArgs, reply *AskForTaskReply) error {
 	if c.Done() {
-		return AllTaskFinished
+		reply = &AskForTaskReply{Code: CodeAllTasksFinished}
+		return nil
 	}
 
 	// find avaible tasks
+	reply.NMap = len(c.mapTasks)
+	reply.NReduce = len(c.reduceTasks)
 	c.lock.Lock()
 	for _, v := range c.mapTasks {
 		if v.Status == NotStart {
-			*t = v
+			v.Status = Running
+			reply = &AskForTaskReply{Code: CodeOk, Task: v}
 			return nil
 		}
 	}
 
 	for _, v := range c.reduceTasks {
 		if v.Status == NotStart {
-			*t = v
+			v.Status = Running
+			reply = &AskForTaskReply{Code: CodeOk, Task: v}
 			return nil
 		}
 	}
 	c.lock.Unlock()
 
-	return NoTaskAvailable
+	reply = &AskForTaskReply{Code: CodeNoAvailableTask}
+	return nil
 }
 
-func (c *Coordinator) FinishTask(task *MRTask, reply *bool) error {
-	index := task.Number - 1
+func (c *Coordinator) FinishTask(args *FinishTaskArgs, reply *FinishTaskReply) error {
+	index := args.Task.Number - 1
 	var taskToChange *MRTask
-	switch task.Type {
+	switch args.Task.Type {
 	case MapType:
 		taskToChange = &c.mapTasks[index]
 	case ReduceType:
@@ -133,5 +139,6 @@ func (c *Coordinator) FinishTask(task *MRTask, reply *bool) error {
 	c.finished++
 	c.lock.Unlock()
 
+	reply.code = CodeOk
 	return nil
 }
