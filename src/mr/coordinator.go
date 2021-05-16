@@ -132,9 +132,9 @@ func (c *Coordinator) AskForTask(args *AskForTaskArgs, reply *AskForTaskReply) e
 	if allMapTasksFinished {
 		for i, v := range c.reduceTasks {
 			if v.Status == StatusNotStart {
-				c.mapTasks[i].Status = StatusRunning
+				c.reduceTasks[i].Status = StatusRunning
 				reply.Code = CodeOk
-				reply.Task = c.mapTasks[i]
+				reply.Task = c.reduceTasks[i]
 				go c.deferCheck(c.reduceTasks, v.Number, 10*time.Second)
 				return nil
 			}
