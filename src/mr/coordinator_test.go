@@ -104,4 +104,3 @@ func TestCoordinator_FinishTask(t *testing.T) {
 
 	fmt.Print(c)
 }
-
