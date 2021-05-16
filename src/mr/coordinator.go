@@ -142,7 +142,7 @@ func (c *Coordinator) AskForTask(args *AskForTaskArgs, reply *AskForTaskReply) e
 
 	}
 
-	reply = &AskForTaskReply{Code: CodeNoAvailableTask}
+	reply.Code = CodeNoAvailableTask
 	return nil
 }
 
