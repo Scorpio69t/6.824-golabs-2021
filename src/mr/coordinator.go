@@ -115,22 +115,31 @@ func (c *Coordinator) AskForTask(args *AskForTaskArgs, reply *AskForTaskReply) e
 	reply.NReduce = len(c.reduceTasks)
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	for _, v := range c.mapTasks {
+
+	allMapTasksFinished := true
+	for i, v := range c.mapTasks {
 		if v.Status == StatusNotStart {
-			v.Status = StatusRunning
-			reply = &AskForTaskReply{Code: CodeOk, Task: v}
+			c.mapTasks[i].Status = StatusRunning
+			reply.Code = CodeOk
+			reply.Task = c.mapTasks[i]
 			go c.deferCheck(c.mapTasks, v.Number, 10*time.Second)
 			return nil
+		} else if v.Status == StatusRunning {
+			allMapTasksFinished = false
 		}
 	}
 
-	for _, v := range c.reduceTasks {
-		if v.Status == StatusNotStart {
-			v.Status = StatusRunning
-			reply = &AskForTaskReply{Code: CodeOk, Task: v}
-			go c.deferCheck(c.reduceTasks, v.Number, 10*time.Second)
-			return nil
+	if allMapTasksFinished {
+		for i, v := range c.reduceTasks {
+			if v.Status == StatusNotStart {
+				c.mapTasks[i].Status = StatusRunning
+				reply.Code = CodeOk
+				reply.Task = c.mapTasks[i]
+				go c.deferCheck(c.reduceTasks, v.Number, 10*time.Second)
+				return nil
+			}
 		}
+
 	}
 
 	reply = &AskForTaskReply{Code: CodeNoAvailableTask}
