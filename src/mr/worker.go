@@ -68,7 +68,8 @@ func Worker(mapf func(string, string) []KeyValue,
 		reducef: reducef,
 	}
 
-	for {
+	running := true
+	for running {
 		var reply AskForTaskReply
 		if !call("Coordinator.AskForTask", &AskForTaskArgs{}, &reply) {
 			fmt.Printf("Cannot call the coordinator. The coordinator may finish.\n")
@@ -80,10 +81,40 @@ func Worker(mapf func(string, string) []KeyValue,
 			ctx.currentTask = reply.Task
 			ctx.nReduce = reply.NReduce
 			ctx.nMap = reply.NMap
-			execTask(&ctx)
+			err := execTask(&ctx)
+			if err != nil {
+				fmt.Print(err)
+				if !call(
+					"Coordinator.FailedTask",
+					&FailedTaskArgs{
+						Reason: err.Error(),
+						Task:   ctx.currentTask,
+					},
+					&FinishTaskReply{}) {
+					running = false
+				} else {
+					time.Sleep(2 * time.Second)
+					continue
+				}
+			}
+
+			// Call FinishTask
+			var fReply FinishTaskReply
+			if !call(
+				"Coordinator.FinishTask",
+				&FinishTaskArgs{
+					Task: ctx.currentTask,
+				},
+				&fReply) {
+				// What should the worker do?
+				// I am confused
+				running = false
+			}
+
 		case CodeAllTasksFinished:
 			fmt.Printf("All tasks finished.")
-			break
+			running = false
+
 		case CodeNoAvailableTask:
 			// No operation
 		}

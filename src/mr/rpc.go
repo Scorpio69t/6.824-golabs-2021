@@ -47,7 +47,15 @@ type FinishTaskArgs struct {
 }
 
 type FinishTaskReply struct {
-	code uint // Status
+	Code uint // Status
+}
+
+type FailedTaskArgs struct {
+	Reason string
+	Task   MRTask
+}
+
+type FailedTaskReply struct {
 }
 
 // Cook up a unique-ish UNIX-domain socket name

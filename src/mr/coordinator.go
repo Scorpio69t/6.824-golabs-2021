@@ -2,12 +2,14 @@ package mr
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"net/rpc"
 	"os"
 	"sync"
+	"time"
 )
 
 type Coordinator struct {
@@ -71,7 +73,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 			Type:   MapType,
 			Number: i + 1,
 			File:   f,
-			Status: NotStart,
+			Status: StatusNotStart,
 		}
 	}
 
@@ -81,7 +83,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 			Type:   ReduceType,
 			Number: i + 1,
 			File:   "",
-			Status: NotStart,
+			Status: StatusNotStart,
 		}
 	}
 
@@ -89,6 +91,17 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 	c.server()
 	return &c
+}
+
+func (c *Coordinator) deferCheck(task []MRTask, number int, timeout time.Duration) {
+	time.Sleep(timeout)
+	c.lock.Lock()
+	if task[number-1].Status != StatusFinished {
+		task[number-1].Status = StatusNotStart
+	} else {
+		c.finished++
+	}
+	c.lock.Unlock()
 }
 
 func (c *Coordinator) AskForTask(args *AskForTaskArgs, reply *AskForTaskReply) error {
@@ -101,22 +114,24 @@ func (c *Coordinator) AskForTask(args *AskForTaskArgs, reply *AskForTaskReply) e
 	reply.NMap = len(c.mapTasks)
 	reply.NReduce = len(c.reduceTasks)
 	c.lock.Lock()
+	defer c.lock.Unlock()
 	for _, v := range c.mapTasks {
-		if v.Status == NotStart {
-			v.Status = Running
+		if v.Status == StatusNotStart {
+			v.Status = StatusRunning
 			reply = &AskForTaskReply{Code: CodeOk, Task: v}
+			go c.deferCheck(c.mapTasks, v.Number, 10*time.Second)
 			return nil
 		}
 	}
 
 	for _, v := range c.reduceTasks {
-		if v.Status == NotStart {
-			v.Status = Running
+		if v.Status == StatusNotStart {
+			v.Status = StatusRunning
 			reply = &AskForTaskReply{Code: CodeOk, Task: v}
+			go c.deferCheck(c.reduceTasks, v.Number, 10*time.Second)
 			return nil
 		}
 	}
-	c.lock.Unlock()
 
 	reply = &AskForTaskReply{Code: CodeNoAvailableTask}
 	return nil
@@ -135,10 +150,31 @@ func (c *Coordinator) FinishTask(args *FinishTaskArgs, reply *FinishTaskReply) e
 	}
 
 	c.lock.Lock()
-	taskToChange.Status = Finished
+	taskToChange.Status = StatusFinished
 	c.finished++
 	c.lock.Unlock()
 
-	reply.code = CodeOk
+	reply.Code = CodeOk
+	return nil
+}
+
+func (c *Coordinator) FailedTask(args *FailedTaskArgs, reply *FailedTaskReply) error {
+	fmt.Printf("Worker %s-%d failed. The Reason is: %s", ConvertTaskTypeToString(args.Task.Type), args.Task.Number, args.Reason)
+
+	index := args.Task.Number - 1
+	var taskToChange *MRTask
+	switch args.Task.Type {
+	case MapType:
+		taskToChange = &c.mapTasks[index]
+	case ReduceType:
+		taskToChange = &c.reduceTasks[index]
+	default:
+		return errors.New("Unknown task type.")
+	}
+
+	c.lock.Lock()
+	taskToChange.Status = StatusNotStart
+	c.lock.Unlock()
+
 	return nil
 }
