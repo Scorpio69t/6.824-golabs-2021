@@ -157,32 +157,9 @@ func execReduceTask(ctx *workerContext) error {
 	}
 	sort.Sort(ByKey(kva))
 
-	// Create the output file
-	oname := "mr-out-" + strconv.Itoa(ctx.currentTask.Number) // mr-out-${reduceNumber}
-	ofile, err := os.Create(oname)
+	err = outputToResults(ctx, kva)
 	if err != nil {
 		return err
-	}
-	defer ofile.Close()
-
-	// For each key
-	i := 0
-	for i < len(kva) {
-		// Merge the same keys
-		j := i + 1
-		for j < len(kva) && kva[j].Key == kva[i].Key {
-			j++
-		}
-		values := []string{}
-		for k := i; k < j; k++ {
-			values = append(values, kva[k].Value)
-		}
-		output := KeyValue{Key: kva[i].Key, Value: ctx.reducef(kva[i].Key, values)}
-
-		// Write
-		fmt.Fprintf(ofile, "%v %v\n", output.Key, output.Value)
-
-		i = j
 	}
 
 	return nil
@@ -250,6 +227,38 @@ func inputFromIntermediate(ctx *workerContext) (kva []KeyValue, err error) {
 	}
 
 	return kva, nil
+}
+
+func outputToResults(ctx *workerContext, kva []KeyValue) (err error) {
+	// Create the output file
+	oname := "mr-out-" + strconv.Itoa(ctx.currentTask.Number) // mr-out-${reduceNumber}
+	ofile, err := os.Create(oname)
+	if err != nil {
+		return err
+	}
+	defer ofile.Close()
+
+	// For each key
+	i := 0
+	for i < len(kva) {
+		// Merge the same keys
+		j := i + 1
+		for j < len(kva) && kva[j].Key == kva[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, kva[k].Value)
+		}
+		output := KeyValue{Key: kva[i].Key, Value: ctx.reducef(kva[i].Key, values)}
+
+		// Write
+		fmt.Fprintf(ofile, "%v %v\n", output.Key, output.Value)
+
+		i = j
+	}
+
+	return nil
 }
 
 //
