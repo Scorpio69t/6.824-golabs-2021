@@ -18,6 +18,8 @@ type Coordinator struct {
 	reduceTasks []MRTask   // the length is nReduce
 	finished    int        // the number of tasks finished
 	lock        sync.Mutex // to protect the shared memory
+	nextToken   uint
+	crashWorker []uint // record the crashed workers
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -89,19 +91,29 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 	c.lock = sync.Mutex{}
 
+	c.nextToken = 1
+
 	c.server()
 	return &c
 }
 
-func (c *Coordinator) deferCheck(task []MRTask, number int, timeout time.Duration) {
+func (c *Coordinator) deferCheck(task *MRTask, token uint, timeout time.Duration) {
 	time.Sleep(timeout)
 	c.lock.Lock()
-	if task[number-1].Status != StatusFinished {
-		task[number-1].Status = StatusNotStart
-	} else {
-		c.finished++
+	if task.Status != StatusFinished {
+		task.Status = StatusNotStart
+		c.crashWorker = append(c.crashWorker, token)
 	}
 	c.lock.Unlock()
+}
+
+func (c *Coordinator) assign(task *MRTask, reply *AskForTaskReply) {
+	task.Status = StatusRunning
+	reply.Code = CodeOk
+	reply.Task = *task
+	go c.deferCheck(task, c.nextToken, 10*time.Second)
+	reply.Token = c.nextToken
+	c.nextToken++
 }
 
 func (c *Coordinator) AskForTask(args *AskForTaskArgs, reply *AskForTaskReply) error {
@@ -110,19 +122,22 @@ func (c *Coordinator) AskForTask(args *AskForTaskArgs, reply *AskForTaskReply) e
 		return nil
 	}
 
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	for _, token := range c.crashWorker {
+		if args.Token == token {
+			reply.Code = CodeWorkerCrash
+			return nil
+		}
+	}
+
 	// find avaible tasks
 	reply.NMap = len(c.mapTasks)
 	reply.NReduce = len(c.reduceTasks)
-	c.lock.Lock()
-	defer c.lock.Unlock()
-
 	allMapTasksFinished := true
 	for i, v := range c.mapTasks {
 		if v.Status == StatusNotStart {
-			c.mapTasks[i].Status = StatusRunning
-			reply.Code = CodeOk
-			reply.Task = c.mapTasks[i]
-			go c.deferCheck(c.mapTasks, v.Number, 10*time.Second)
+			c.assign(&c.mapTasks[i], reply)
 			return nil
 		} else if v.Status == StatusRunning {
 			allMapTasksFinished = false
@@ -132,14 +147,10 @@ func (c *Coordinator) AskForTask(args *AskForTaskArgs, reply *AskForTaskReply) e
 	if allMapTasksFinished {
 		for i, v := range c.reduceTasks {
 			if v.Status == StatusNotStart {
-				c.reduceTasks[i].Status = StatusRunning
-				reply.Code = CodeOk
-				reply.Task = c.reduceTasks[i]
-				go c.deferCheck(c.reduceTasks, v.Number, 10*time.Second)
+				c.assign(&c.reduceTasks[i], reply)
 				return nil
 			}
 		}
-
 	}
 
 	reply.Code = CodeNoAvailableTask

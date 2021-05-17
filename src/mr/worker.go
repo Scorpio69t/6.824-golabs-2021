@@ -32,6 +32,7 @@ type workerContext struct {
 	nMap        int
 	mapf        func(string, string) []KeyValue
 	reducef     func(string, []string) string
+	token       uint // The unique key for a worker, that will be changed after asking a atsk
 }
 
 // for sorting by key.
@@ -66,12 +67,13 @@ func Worker(mapf func(string, string) []KeyValue,
 	ctx := workerContext{
 		mapf:    mapf,
 		reducef: reducef,
+		token:   0,
 	}
 
 	running := true
 	for running {
 		var reply AskForTaskReply
-		if !call("Coordinator.AskForTask", &AskForTaskArgs{}, &reply) {
+		if !call("Coordinator.AskForTask", &AskForTaskArgs{Token: ctx.token}, &reply) {
 			fmt.Printf("Cannot call the coordinator. The coordinator may finish.\n")
 			break
 		}
@@ -81,6 +83,7 @@ func Worker(mapf func(string, string) []KeyValue,
 			ctx.currentTask = reply.Task
 			ctx.nReduce = reply.NReduce
 			ctx.nMap = reply.NMap
+			ctx.token = reply.Token
 			err := execTask(&ctx)
 			if err != nil {
 				fmt.Print(err)
@@ -116,6 +119,9 @@ func Worker(mapf func(string, string) []KeyValue,
 			running = false
 
 		case CodeNoAvailableTask:
+			// No operation
+
+		case CodeWorkerCrash:
 			// No operation
 		}
 

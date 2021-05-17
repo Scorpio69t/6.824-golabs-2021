@@ -30,9 +30,11 @@ const (
 	CodeOk               = iota
 	CodeNoAvailableTask  = iota
 	CodeAllTasksFinished = iota
+	CodeWorkerCrash      = iota
 )
 
 type AskForTaskArgs struct {
+	Token uint
 }
 
 type AskForTaskReply struct {
@@ -40,6 +42,7 @@ type AskForTaskReply struct {
 	Task    MRTask
 	NReduce int
 	NMap    int
+	Token   uint
 }
 
 type FinishTaskArgs struct {

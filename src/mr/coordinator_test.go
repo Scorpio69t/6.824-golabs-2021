@@ -2,6 +2,7 @@ package mr
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -88,7 +89,7 @@ func TestCoordinator_FinishTask(t *testing.T) {
 		call("Coordinator.FinishTask", &FinishTaskArgs{Task: askForTaskReply.Task}, &finishTaskReply)
 	}
 
-	if c.finished != 13 {
+	if c.finished != nMap+nReduce {
 		t.Fail()
 	}
 	for _, task := range c.mapTasks {
@@ -100,6 +101,42 @@ func TestCoordinator_FinishTask(t *testing.T) {
 		if task.Status != StatusFinished {
 			t.Fail()
 		}
+	}
+
+	fmt.Print(c)
+}
+
+func TestCoordinator_deferCheck(t *testing.T) {
+	nMap := 3
+	nReduce := 10
+	c := runCoordinator(nMap, nReduce)
+	waitGroup := sync.WaitGroup{}
+
+	for i := 0; i < nMap; i++ {
+		var askForTaskReply AskForTaskReply
+		call("Coordinator.AskForTask", &AskForTaskArgs{Token: 0}, &askForTaskReply)
+		if askForTaskReply.Code != CodeOk {
+			t.Fail()
+		}
+		if askForTaskReply.NReduce != nReduce || askForTaskReply.NMap != nMap {
+			t.Fail()
+		}
+		waitGroup.Add(1)
+		go func(wg *sync.WaitGroup, token uint) {
+			time.Sleep(10*time.Second + 100*time.Millisecond)
+			var askForTaskReply2 AskForTaskReply
+			call("Coordinator.AskForTask", &AskForTaskArgs{Token: token}, &askForTaskReply2)
+			if askForTaskReply2.Code != CodeWorkerCrash {
+				t.Fail()
+			}
+			wg.Done()
+		}(&waitGroup, askForTaskReply.Token)
+	}
+
+	waitGroup.Wait()
+
+	if len(c.crashWorker) != nMap {
+		t.Fail()
 	}
 
 	fmt.Print(c)
