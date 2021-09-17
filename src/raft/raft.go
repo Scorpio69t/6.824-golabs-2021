@@ -182,10 +182,15 @@ type RequestVoteReply struct {
 }
 
 func (r *Raft) handleRPC(args interface{}) (response RPCResponse) {
-	ch := make(chan RPCResponse)
-	rpc := MakeRPC(args, ch)
+	// r.Debug("RPC: enter handleRPC\n")
+	// defer r.Debug("RPC: leave handleRPC\n")
+
+	respCh := make(chan RPCResponse)
+	rpc := MakeRPC(args, respCh)
 	r.rpcCh <- rpc
-	resp := <-ch
+
+	// r.Debug("RPC: wait for respCh\n")
+	resp := <-respCh
 	return resp
 }
 
@@ -195,6 +200,8 @@ func (r *Raft) processRPC(rpc RPC) {
 		r.requestVote(rpc, args)
 	case *AppendEntriesArgs:
 		r.appendEntries(rpc, args)
+	default:
+		r.Error("Unknown RPC type.\n")
 	}
 }
 
@@ -204,16 +211,21 @@ func (r *Raft) processRPC(rpc RPC) {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	session := uuid.NewString()
-	rf.Debug("Receive RequestVote(%s): %v\n", session, *args)
+	rf.Debug("RPC: receive RequestVote(%s): candidate=%d, term=%d\n", session, args.CandidateId, args.Term)
+	defer func() {
+		rf.Debug("RPC: answer RequestVote(%s): candidate=%d, term=%d, granted=%d\n", session, args.CandidateId, reply.Term, reply.VoteGranted)
+	}()
+
 	response := rf.handleRPC(args)
 	reply.Term = response.Response.(*RequestVoteReply).Term
 	reply.VoteGranted = response.Response.(*RequestVoteReply).VoteGranted
-	rf.Debug("Answer RequestVote(%s): %v\n", session, *reply)
-
 }
 
 func (r *Raft) requestVote(rpc RPC, args *RequestVoteArgs) {
-	resp := &AppendEntriesReply{}
+	// r.Debug("RPC: enter requestVote\n")
+	// defer r.Debug("RPC: leave requestVote\n")
+
+	resp := &RequestVoteReply{}
 	var err error
 	defer func() {
 		rpc.Response(resp, err)
@@ -240,7 +252,7 @@ func (r *Raft) requestVote(rpc RPC, args *RequestVoteArgs) {
 	if r.state.LastVoteTerm() == uint64(args.Term) && r.state.LastVoteFor() != -1 {
 		r.Warn("Duplicated RequestVote, term=%d\n", args.Term)
 		if r.state.LastVoteFor() == int32(args.CandidateId) {
-			resp.Success = true
+			resp.VoteGranted = true
 		}
 		return
 	}
@@ -257,7 +269,9 @@ func (r *Raft) requestVote(rpc RPC, args *RequestVoteArgs) {
 	}
 
 	// Grant vote for the candidate.
-	resp.Success = true
+	r.Info("Vote for candidate=%d, term=%d\n", args.CandidateId, args.Term)
+	resp.VoteGranted = true
+	resp.Term = args.Term
 	r.state.SetLastVoteTerm(r.state.getCurrentTerm())
 	r.state.SetLastVoteFor(int32(args.CandidateId))
 	r.SetLastContact()
@@ -278,6 +292,12 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	session := uuid.NewString()
+	rf.Debug("RPC: receive AppendEntries(%s): leader=%d, term=%d\n", session, args.LeaderId, args.Term)
+	defer func() {
+		rf.Debug("RPC: answer AppendEntries(%s): term=%d, success=%d", session, reply.Term, reply.Success)
+	}()
+
 	response := rf.handleRPC(args)
 	reply.Success = response.Response.(*AppendEntriesReply).Success
 	reply.Term = response.Response.(*AppendEntriesReply).Term
@@ -296,15 +316,19 @@ func (r *Raft) appendEntries(rpc RPC, args *AppendEntriesArgs) {
 	}()
 
 	if r.state.getCurrentTerm() > uint64(args.Term) {
+		r.Debug("RPC: appendEntries: receive older term\n")
 		return
 	}
-	if r.state.getCurrentTerm() < uint64(args.Term) || r.state.state != Follower {
+
+	if r.me != args.LeaderId && (r.state.getCurrentTerm() < uint64(args.Term) || r.state.getState() != Follower) {
+		r.Debug("RPC: appendEntries: find new leader: leader=%d, term=%d\n", args.LeaderId, args.Term)
 		r.setState(Follower)
 		r.setCurrentTerm(uint64(args.Term))
 		resp.Term = args.Term
 	}
 
 	// Success
+	r.Debug("RPC: appendEntries: success\n")
 	r.SetLastContact()
 	r.leaderId = args.LeaderId
 	resp.Success = true
@@ -345,7 +369,11 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	rf.Debug("RPC: sendRequestVote, server=%d\n", server)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	if !ok {
+		rf.Warn("RPC: sendRequestVote failed.\n")
+	}
 	return ok
 }
 
@@ -410,7 +438,7 @@ func (r *Raft) run() {
 		}
 
 		// Run a sub FSM
-		switch r.state.state {
+		switch r.state.getState() {
 		case Follower:
 			r.runFollower()
 		case Candidate:
@@ -430,12 +458,12 @@ func (r *Raft) runFollower() {
 	heartbeatTimer := randomTimeout(time.Millisecond * 150)
 
 	// A long loop for follower.
-	for r.state.state == Follower {
+	for r.state.getState() == Follower {
 		select {
 		case <-r.killCh:
 			return
 		case rpc := <-r.rpcCh:
-			r.handleRPC(rpc)
+			r.processRPC(rpc)
 		case <-heartbeatTimer:
 			// Clear the timeout.
 			heartbeatTimeout := randomTimeoutInt((int(time.Millisecond) * 150))
@@ -458,11 +486,23 @@ func (r *Raft) runFollower() {
 
 func (r *Raft) runCandidate() {
 	r.Debug("runCandidate")
+	r.Info("start election: term=%d\n", r.state.getCurrentTerm())
 	electionTimeout := randomTimeout(time.Millisecond * 2000)
 
 	// Vote channel.
 	voteCh := make(chan *RequestVoteReply, 5)
-	defer close(voteCh)
+	done := false
+	doneMutex := sync.Mutex{}
+	defer func() {
+		doneMutex.Lock()
+		defer func() {
+			doneMutex.Unlock()
+			r.Debug("leave runCandidate")
+		}()
+
+		close(voteCh)
+		done = true
+	}()
 
 	// Votes counter.
 	grantedVotes := 0
@@ -491,19 +531,22 @@ func (r *Raft) runCandidate() {
 		go func(server int) {
 			reply := &RequestVoteReply{}
 			ok := r.sendRequestVote(server, args, reply)
-			if ok {
+
+			doneMutex.Lock()
+			if !done && ok {
 				voteCh <- reply
 			}
+			doneMutex.Unlock()
 		}(peer)
 	}
 
 	// A long loop for waiting votes.
-	for r.state.state == Candidate {
+	for r.state.getState() == Candidate {
 		select {
 		case <-r.killCh:
 			return
 		case rpc := <-r.rpcCh:
-			r.handleRPC(rpc)
+			r.processRPC(rpc)
 		case <-electionTimeout:
 			// Increase term and start a new round of election.
 			r.Info("electionTimeout\n")
@@ -534,16 +577,31 @@ func (r *Raft) runCandidate() {
 
 func (r *Raft) runLeader() {
 	r.Debug("runLeader")
+
+	// transferToFollowerCh will not be closed until stillLeader becomes false
 	stillLeader := true
-	transferToFollowerCh := make(chan int)
+	stillLeaderMutex := sync.Mutex{}
+	transferToFollowerCh := make(chan int, 1)
+
+	// Close the channel.
 	defer func() {
+		stillLeaderMutex.Lock()
+		defer stillLeaderMutex.Unlock()
+
 		close(transferToFollowerCh)
 		stillLeader = false
 	}()
 
 	// Send heartbeats.
 	go func() {
-		for stillLeader {
+		for {
+			stillLeaderMutex.Lock()
+			if !stillLeader {
+				stillLeaderMutex.Unlock()
+				return
+			}
+			stillLeaderMutex.Unlock()
+			
 			args := &AppendEntriesArgs{
 				Term:     int(r.state.getCurrentTerm()),
 				LeaderId: r.me,
@@ -559,17 +617,21 @@ func (r *Raft) runLeader() {
 				}
 				go func(server int) {
 					reply := &AppendEntriesReply{}
-					ok := r.sendAppendEntries(peer, args, reply)
-					if ok && reply.Term > int(r.state.getCurrentTerm()) {
+					ok := r.sendAppendEntries(server, args, reply)
+
+					stillLeaderMutex.Lock()
+					defer stillLeaderMutex.Unlock()
+					if stillLeader && ok && reply.Term > int(r.state.getCurrentTerm()) {
 						transferToFollowerCh <- reply.Term
 					}
 				}(peer)
 			}
+
 			time.Sleep(150 * time.Millisecond)
 		}
 	}()
 
-	for r.state.state == Leader {
+	for r.state.getState() == Leader {
 		select {
 		case term := <-transferToFollowerCh:
 			r.Info("find higher term, leader(%d) -> follower(%d\n", r.state.getCurrentTerm(), term)
@@ -579,7 +641,7 @@ func (r *Raft) runLeader() {
 		case <-r.killCh:
 			return
 		case rpc := <-r.rpcCh:
-			r.handleRPC(rpc)
+			r.processRPC(rpc)
 		}
 	}
 }
@@ -627,16 +689,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	r.setState(Follower)
 	r.state.SetLastVoteFor(-1)
 	r.state.SetLastVoteTerm(0)
+	r.leaderId = -1
 
 	// Debug
 	r.logger = *log.Default()
+	r.logger.SetFlags(log.Lmicroseconds)
 	r.debug = true
 
 	r.SetLastContact()
 
 	// Channels
-	r.rpcCh = make(chan RPC)
-	r.killCh = make(chan struct{})
+	r.rpcCh = make(chan RPC, 3)
+	r.killCh = make(chan struct{}, 1)
 
 	// initialize from state persisted before a crash
 	r.readPersist(persister.ReadRaftState())
@@ -648,7 +712,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Debug
 	go func() {
-		for r.dead == 0 {
+		for !r.killed() {
 			// r.Debug("lastVoteTerm=%d, voteFor=%d", r.state.LastVoteTerm(), r.state.LastVoteFor())
 			time.Sleep(2000 * time.Millisecond)
 		}
