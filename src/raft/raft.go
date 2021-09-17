@@ -19,7 +19,7 @@ package raft
 
 import (
 	//	"bytes"
-	"fmt"
+
 	"log"
 	"sync"
 	"sync/atomic"
@@ -27,6 +27,7 @@ import (
 
 	//	"6.824/labgob"
 	"6.824/labrpc"
+	"github.com/google/uuid"
 )
 
 //
@@ -62,7 +63,9 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
+	// Debug
 	logger log.Logger
+	debug  bool
 
 	// Your data here (2A, 2B, 2C).
 	leaderId         int
@@ -200,9 +203,13 @@ func (r *Raft) processRPC(rpc RPC) {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	session := uuid.NewString()
+	rf.Debug("Receive RequestVote(%s): %v\n", session, *args)
 	response := rf.handleRPC(args)
 	reply.Term = response.Response.(*RequestVoteReply).Term
 	reply.VoteGranted = response.Response.(*RequestVoteReply).VoteGranted
+	rf.Debug("Answer RequestVote(%s): %v\n", session, *reply)
+
 }
 
 func (r *Raft) requestVote(rpc RPC, args *RequestVoteArgs) {
@@ -214,7 +221,7 @@ func (r *Raft) requestVote(rpc RPC, args *RequestVoteArgs) {
 
 	// Leader already existed.
 	if r.leaderId != -1 && r.leaderId != args.CandidateId {
-		r.logger.Printf("Leader existed. leaderId=%d, candidateId=%d", r.leaderId, args.CandidateId)
+		r.Warn("Leader existed. leaderId=%d, candidateId=%d", r.leaderId, args.CandidateId)
 		return
 	}
 
@@ -225,13 +232,13 @@ func (r *Raft) requestVote(rpc RPC, args *RequestVoteArgs) {
 
 	// Found newer term, transfer to follower and update term.
 	if args.Term > int(r.state.getCurrentTerm()) {
-		r.state.setState(Follower)
-		r.state.setCurrentTerm(uint64(args.Term))
+		r.setState(Follower)
+		r.setCurrentTerm(uint64(args.Term))
 	}
 
 	// Have voted in this term.
 	if r.state.LastVoteTerm() == uint64(args.Term) && r.state.LastVoteFor() != -1 {
-		r.logger.Printf("Duplicated RequestVote, term=%d\n", args.Term)
+		r.Warn("Duplicated RequestVote, term=%d\n", args.Term)
 		if r.state.LastVoteFor() == int32(args.CandidateId) {
 			resp.Success = true
 		}
@@ -241,11 +248,11 @@ func (r *Raft) requestVote(rpc RPC, args *RequestVoteArgs) {
 	// Compare lastTerm and lastIndex
 	lastIndex, lastTerm := r.state.getLastLog()
 	if lastTerm > uint64(args.Term) {
-		log.Printf("Our lastTerm is greater.\n")
+		r.Info("Our lastTerm is greater.\n")
 		return
 	}
 	if lastTerm == args.LastLogTerm && lastIndex > args.LastLogIndex {
-		log.Printf("Our term is equal to args's, but the lastIndex is greater.\n")
+		r.Info("Our term is equal to args's, but the lastIndex is greater.\n")
 		return
 	}
 
@@ -292,8 +299,8 @@ func (r *Raft) appendEntries(rpc RPC, args *AppendEntriesArgs) {
 		return
 	}
 	if r.state.getCurrentTerm() < uint64(args.Term) || r.state.state != Follower {
-		r.state.setState(Follower)
-		r.state.setCurrentTerm(uint64(args.Term))
+		r.setState(Follower)
+		r.setCurrentTerm(uint64(args.Term))
 		resp.Term = args.Term
 	}
 
@@ -380,7 +387,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-	rf.state.state = Shutdown
+	rf.setState(Shutdown)
 	rf.killCh <- struct{}{}
 }
 
@@ -391,12 +398,15 @@ func (rf *Raft) killed() bool {
 
 // run is a long running goroutine.
 func (r *Raft) run() {
+	r.Debug("run")
 	for !r.killed() {
 		select {
 		case <-r.killCh:
 			// Clear the leaderID.
 			r.leaderId = -1
 			return
+		default:
+			// No operation.
 		}
 
 		// Run a sub FSM
@@ -408,7 +418,7 @@ func (r *Raft) run() {
 		case Leader:
 			r.runLeader()
 		default:
-			r.logger.Printf("run(): unknown state, return.\n")
+			r.Debug("run(): unknown state, return.\n")
 			return
 		}
 	}
@@ -416,7 +426,7 @@ func (r *Raft) run() {
 
 func (r *Raft) runFollower() {
 	// TODO: 2A
-	r.logger.Printf("enter state=follower, term=%d\n", r.state.getCurrentTerm())
+	r.Debug("runFollower")
 	heartbeatTimer := randomTimeout(time.Millisecond * 150)
 
 	// A long loop for follower.
@@ -438,8 +448,8 @@ func (r *Raft) runFollower() {
 
 			// Switch to the candidate state.
 			r.leaderId = -1
-			r.state.setCurrentTerm(r.state.getCurrentTerm() + 1)
-			r.state.setState(Candidate)
+			r.setCurrentTerm(r.state.getCurrentTerm() + 1)
+			r.setState(Candidate)
 			return
 		}
 	}
@@ -447,11 +457,11 @@ func (r *Raft) runFollower() {
 }
 
 func (r *Raft) runCandidate() {
-	r.logger.Printf("enter state=candidate, term=%d\n", r.state.getCurrentTerm())
-	electionTimeout := randomTimeout(time.Microsecond * 2000)
+	r.Debug("runCandidate")
+	electionTimeout := randomTimeout(time.Millisecond * 2000)
 
 	// Vote channel.
-	voteCh := make(chan *RequestVoteReply)
+	voteCh := make(chan *RequestVoteReply, 5)
 	defer close(voteCh)
 
 	// Votes counter.
@@ -496,13 +506,14 @@ func (r *Raft) runCandidate() {
 			r.handleRPC(rpc)
 		case <-electionTimeout:
 			// Increase term and start a new round of election.
-			r.state.setCurrentTerm(r.state.getCurrentTerm() + 1)
+			r.Info("electionTimeout\n")
+			r.setCurrentTerm(r.state.getCurrentTerm() + 1)
 			return
 		case reply := <-voteCh:
 			// Find higher term, become the follower state.
 			if reply.Term > int(r.state.currentTerm) {
-				r.state.setCurrentTerm(uint64(reply.Term))
-				r.state.setState(Follower)
+				r.setCurrentTerm(uint64(reply.Term))
+				r.setState(Follower)
 				return
 			}
 
@@ -511,9 +522,9 @@ func (r *Raft) runCandidate() {
 				grantedVotes++
 				if grantedVotes >= neededVotes {
 					// Switch to the leader state.
-					r.logger.Printf("election won, term=%d\n", r.state.getCurrentTerm())
+					r.Info("election won, term=%d\n", r.state.getCurrentTerm())
 					r.leaderId = r.me
-					r.state.setState(Leader)
+					r.setState(Leader)
 					return
 				}
 			}
@@ -522,7 +533,7 @@ func (r *Raft) runCandidate() {
 }
 
 func (r *Raft) runLeader() {
-	r.logger.Printf("enter state=leader, term=%d\n", r.state.getCurrentTerm())
+	r.Debug("runLeader")
 	stillLeader := true
 	transferToFollowerCh := make(chan int)
 	defer func() {
@@ -561,9 +572,9 @@ func (r *Raft) runLeader() {
 	for r.state.state == Leader {
 		select {
 		case term := <-transferToFollowerCh:
-			r.logger.Printf("find higher term, leader(%d) -> follower(%d\n", r.state.getCurrentTerm(), term)
-			r.state.state = Follower
-			r.state.setCurrentTerm(uint64(term))
+			r.Info("find higher term, leader(%d) -> follower(%d\n", r.state.getCurrentTerm(), term)
+			r.setState(Follower)
+			r.setCurrentTerm(uint64(term))
 			return
 		case <-r.killCh:
 			return
@@ -571,6 +582,20 @@ func (r *Raft) runLeader() {
 			r.handleRPC(rpc)
 		}
 	}
+}
+
+func (r *Raft) setState(state RaftState) {
+	if r.debug {
+		r.Debug("state: %s -> %s\n", r.state.getState().String(), state.String())
+	}
+	r.state.setState(state)
+}
+
+func (r *Raft) setCurrentTerm(term uint64) {
+	if r.debug {
+		r.Debug("term: %d -> %d\n", r.state.getCurrentTerm(), term)
+	}
+	r.state.setCurrentTerm(term)
 }
 
 //
@@ -594,18 +619,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	// States
 	r.state = &raftState{}
-	r.state.setCurrentTerm(0)
+	r.setCurrentTerm(0)
 	r.state.setCommitIndex(0)
 	r.state.setLastApplied(0)
 	r.state.setLastSnapshot(0, 0)
 	r.state.setLastLog(0, 0)
-	r.state.setState(Follower)
+	r.setState(Follower)
 	r.state.SetLastVoteFor(-1)
 	r.state.SetLastVoteTerm(0)
 
-	// Logger
+	// Debug
 	r.logger = *log.Default()
-	r.logger.SetPrefix(fmt.Sprintf("Id=%d\t", r.me))
+	r.debug = true
 
 	r.SetLastContact()
 
@@ -620,6 +645,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// I don't want to implement it this way!
 	// go rf.ticker()
 	go r.run()
+
+	// Debug
+	go func() {
+		for r.dead == 0 {
+			// r.Debug("lastVoteTerm=%d, voteFor=%d", r.state.LastVoteTerm(), r.state.LastVoteFor())
+			time.Sleep(2000 * time.Millisecond)
+		}
+	}()
 
 	return r
 }
