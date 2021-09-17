@@ -71,6 +71,26 @@ type raftState struct {
 
 	// The current state
 	state RaftState
+
+	// Vote state
+	lastVoteTerm uint64
+	lastVoteFor  int32
+}
+
+func (r *raftState) LastVoteTerm() uint64 {
+	return atomic.LoadUint64(&r.lastVoteTerm)
+}
+
+func (r *raftState) SetLastVoteTerm(term uint64) {
+	atomic.StoreUint64(&r.lastVoteTerm, term)
+}
+
+func (r *raftState) LastVoteFor() int32 {
+	return atomic.LoadInt32(&r.lastVoteFor)
+}
+
+func (r *raftState) SetLastVoteFor(voteFor int32) {
+	atomic.StoreInt32(&r.lastVoteFor, voteFor)
 }
 
 func (r *raftState) getState() RaftState {
