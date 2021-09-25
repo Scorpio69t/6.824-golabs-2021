@@ -75,6 +75,10 @@ type raftState struct {
 	// Vote state
 	lastVoteTerm uint64
 	lastVoteFor  int32
+
+	// Leader state
+	nextIndex []uint64
+	matchIndex []uint64
 }
 
 func (r *raftState) LastVoteTerm() uint64 {

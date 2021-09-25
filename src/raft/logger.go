@@ -28,6 +28,6 @@ func (r *Raft) Error(format string, args ...interface{}) {
 }
 
 func (r *Raft) Print(format string, args ...interface{}) {
-	format = fmt.Sprintf("{id=%d, state=%s, term=%d}: %s", r.me, r.state.getState().String(), r.state.getCurrentTerm(), format)
+	format = fmt.Sprintf("{id=%d, state=%s, term=%d}: %s", r.me, r.raftState.getState().String(), r.raftState.getCurrentTerm(), format)
 	r.logger.Printf(format, args...)
 }

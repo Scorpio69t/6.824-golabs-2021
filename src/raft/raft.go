@@ -68,17 +68,28 @@ type Raft struct {
 	debug  bool
 
 	// Your data here (2A, 2B, 2C).
-	leaderId         int
-	state            *raftState
+	leaderId int
+	raftState
 	lastContact      time.Time
 	lastContactMutex sync.RWMutex
+	logEntries       []*LogEntry
 
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
 	// Channels for communication
-	rpcCh  chan RPC
-	killCh chan struct{}
+	rpcCh   chan RPC
+	killCh  chan struct{}
+	applyCh chan ApplyMsg
+	logCh   chan *LogFuture
+
+	// Mutex
+	// Protect r.Start().
+	startLock sync.Mutex
+}
+
+func (r *Raft) pushLogToLocal(log *LogEntry) {
+	r.logEntries = append(r.logEntries, log)
 }
 
 func (r *Raft) LastContact() time.Time {
@@ -98,7 +109,7 @@ func (r *Raft) SetLastContact() {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
-	return int(rf.state.getCurrentTerm()), rf.state.getState() == Leader
+	return int(rf.raftState.getCurrentTerm()), rf.raftState.getState() == Leader
 }
 
 //
@@ -238,27 +249,27 @@ func (r *Raft) requestVote(rpc RPC, args *RequestVoteArgs) {
 	}
 
 	// Ignore older term.
-	if args.Term < int(r.state.getCurrentTerm()) {
+	if args.Term < int(r.raftState.getCurrentTerm()) {
 		return
 	}
 
 	// Found newer term, transfer to follower and update term.
-	if args.Term > int(r.state.getCurrentTerm()) {
+	if args.Term > int(r.raftState.getCurrentTerm()) {
 		r.setState(Follower)
 		r.setCurrentTerm(uint64(args.Term))
 	}
 
 	// Have voted in this term.
-	if r.state.LastVoteTerm() == uint64(args.Term) && r.state.LastVoteFor() != -1 {
+	if r.raftState.LastVoteTerm() == uint64(args.Term) && r.raftState.LastVoteFor() != -1 {
 		r.Warn("Duplicated RequestVote, term=%d\n", args.Term)
-		if r.state.LastVoteFor() == int32(args.CandidateId) {
+		if r.raftState.LastVoteFor() == int32(args.CandidateId) {
 			resp.VoteGranted = true
 		}
 		return
 	}
 
 	// Compare lastTerm and lastIndex
-	lastIndex, lastTerm := r.state.getLastLog()
+	lastIndex, lastTerm := r.raftState.getLastLog()
 	if lastTerm > uint64(args.Term) {
 		r.Info("Our lastTerm is greater.\n")
 		return
@@ -272,8 +283,8 @@ func (r *Raft) requestVote(rpc RPC, args *RequestVoteArgs) {
 	r.Info("Vote for candidate=%d, term=%d\n", args.CandidateId, args.Term)
 	resp.VoteGranted = true
 	resp.Term = args.Term
-	r.state.SetLastVoteTerm(r.state.getCurrentTerm())
-	r.state.SetLastVoteFor(int32(args.CandidateId))
+	r.raftState.SetLastVoteTerm(r.raftState.getCurrentTerm())
+	r.raftState.SetLastVoteFor(int32(args.CandidateId))
 	r.SetLastContact()
 }
 
@@ -282,7 +293,7 @@ type AppendEntriesArgs struct {
 	LeaderId     int
 	PrevLogIndex uint64
 	PrevLogTerm  uint64
-	Entries      []*Log
+	Entries      []*LogEntry
 	LeaderCommit uint64
 }
 
@@ -307,7 +318,7 @@ func (r *Raft) appendEntries(rpc RPC, args *AppendEntriesArgs) {
 	// TODO: 2B
 	// Defer return rpc.
 	resp := &AppendEntriesReply{
-		Term:    int(r.state.getCurrentTerm()),
+		Term:    int(r.raftState.getCurrentTerm()),
 		Success: false,
 	}
 	var err error
@@ -315,12 +326,12 @@ func (r *Raft) appendEntries(rpc RPC, args *AppendEntriesArgs) {
 		rpc.Response(resp, err)
 	}()
 
-	if r.state.getCurrentTerm() > uint64(args.Term) {
+	if r.raftState.getCurrentTerm() > uint64(args.Term) {
 		r.Debug("RPC: appendEntries: receive older term\n")
 		return
 	}
 
-	if r.me != args.LeaderId && (r.state.getCurrentTerm() < uint64(args.Term) || r.state.getState() != Follower) {
+	if r.me != args.LeaderId && (r.raftState.getCurrentTerm() < uint64(args.Term) || r.raftState.getState() != Follower) {
 		r.Debug("RPC: appendEntries: find new leader: leader=%d, term=%d\n", args.LeaderId, args.Term)
 		r.setState(Follower)
 		r.setCurrentTerm(uint64(args.Term))
@@ -391,14 +402,38 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // term. the third return value is true if this server believes it is
 // the leader.
 //
-func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
+func (r *Raft) Start(command interface{}) (index int, term int, isLeader bool) {
 	// Your code here (2B).
+	r.startLock.Lock()
+	defer r.startLock.Unlock()
 
-	return index, term, isLeader
+	index = int(r.getLastIndex()) + 1
+	term = int(r.raftState.getCurrentTerm())
+	isLeader = r.raftState.getState() == Leader
+
+	// Do nothing if it is not the leader.
+	if !isLeader {
+		return
+	}
+
+	// Send new entry to r.logCh
+	logFuture := &LogFuture{
+		log: &LogEntry{
+			term:    uint64(term),
+			index:   uint64(index),
+			command: command,
+		},
+		respCh: make(chan bool),
+	}
+	r.logCh <- logFuture
+
+	// Wait for completing appending the log. The step is for thread-safety.
+	success := <-logFuture.respCh
+	if !success {
+		r.Warn("r.Start(): failed.")
+	}
+
+	return
 }
 
 //
@@ -438,7 +473,7 @@ func (r *Raft) run() {
 		}
 
 		// Run a sub FSM
-		switch r.state.getState() {
+		switch r.raftState.getState() {
 		case Follower:
 			r.runFollower()
 		case Candidate:
@@ -458,7 +493,7 @@ func (r *Raft) runFollower() {
 	heartbeatTimer := randomTimeout(time.Millisecond * 150)
 
 	// A long loop for follower.
-	for r.state.getState() == Follower {
+	for r.raftState.getState() == Follower {
 		select {
 		case <-r.killCh:
 			return
@@ -476,9 +511,12 @@ func (r *Raft) runFollower() {
 
 			// Switch to the candidate state.
 			r.leaderId = -1
-			r.setCurrentTerm(r.state.getCurrentTerm() + 1)
+			r.setCurrentTerm(r.raftState.getCurrentTerm() + 1)
 			r.setState(Candidate)
 			return
+		case lf := <-r.logCh:
+			r.Warn("receive from logCh, but not leader.")
+			lf.respCh <- false
 		}
 	}
 
@@ -486,7 +524,7 @@ func (r *Raft) runFollower() {
 
 func (r *Raft) runCandidate() {
 	r.Debug("runCandidate")
-	r.Info("start election: term=%d\n", r.state.getCurrentTerm())
+	r.Info("start election: term=%d\n", r.raftState.getCurrentTerm())
 	electionTimeout := randomTimeout(time.Millisecond * 2000)
 
 	// Vote channel.
@@ -510,18 +548,18 @@ func (r *Raft) runCandidate() {
 
 	// Vote for self.
 	voteCh <- &RequestVoteReply{
-		Term:        int(r.state.currentTerm),
+		Term:        int(r.raftState.currentTerm),
 		VoteGranted: true,
 	}
-	r.state.SetLastVoteFor(int32(r.me))
-	r.state.SetLastVoteTerm(r.state.currentTerm)
+	r.raftState.SetLastVoteFor(int32(r.me))
+	r.raftState.SetLastVoteTerm(r.raftState.currentTerm)
 
 	// Send RequestVote RPC
 	args := &RequestVoteArgs{
-		Term:         int(r.state.getCurrentTerm()),
+		Term:         int(r.raftState.getCurrentTerm()),
 		CandidateId:  r.me,
-		LastLogIndex: r.state.getLastIndex(),
-		LastLogTerm:  r.state.lastLogTerm,
+		LastLogIndex: r.raftState.getLastIndex(),
+		LastLogTerm:  r.raftState.lastLogTerm,
 	}
 	for peer := range r.peers {
 		// Skip me.
@@ -541,7 +579,7 @@ func (r *Raft) runCandidate() {
 	}
 
 	// A long loop for waiting votes.
-	for r.state.getState() == Candidate {
+	for r.raftState.getState() == Candidate {
 		select {
 		case <-r.killCh:
 			return
@@ -550,11 +588,11 @@ func (r *Raft) runCandidate() {
 		case <-electionTimeout:
 			// Increase term and start a new round of election.
 			r.Info("electionTimeout\n")
-			r.setCurrentTerm(r.state.getCurrentTerm() + 1)
+			r.setCurrentTerm(r.raftState.getCurrentTerm() + 1)
 			return
 		case reply := <-voteCh:
 			// Find higher term, become the follower state.
-			if reply.Term > int(r.state.currentTerm) {
+			if reply.Term > int(r.raftState.currentTerm) {
 				r.setCurrentTerm(uint64(reply.Term))
 				r.setState(Follower)
 				return
@@ -565,12 +603,15 @@ func (r *Raft) runCandidate() {
 				grantedVotes++
 				if grantedVotes >= neededVotes {
 					// Switch to the leader state.
-					r.Info("election won, term=%d\n", r.state.getCurrentTerm())
+					r.Info("election won, term=%d\n", r.raftState.getCurrentTerm())
 					r.leaderId = r.me
 					r.setState(Leader)
 					return
 				}
 			}
+		case lf := <-r.logCh:
+			r.Warn("receive from logCh, but not leader.")
+			lf.respCh <- false
 		}
 	}
 }
@@ -601,9 +642,9 @@ func (r *Raft) runLeader() {
 				return
 			}
 			stillLeaderMutex.Unlock()
-			
+
 			args := &AppendEntriesArgs{
-				Term:     int(r.state.getCurrentTerm()),
+				Term:     int(r.raftState.getCurrentTerm()),
 				LeaderId: r.me,
 				// TODO: 2B
 				PrevLogIndex: 0,
@@ -621,7 +662,7 @@ func (r *Raft) runLeader() {
 
 					stillLeaderMutex.Lock()
 					defer stillLeaderMutex.Unlock()
-					if stillLeader && ok && reply.Term > int(r.state.getCurrentTerm()) {
+					if stillLeader && ok && reply.Term > int(r.raftState.getCurrentTerm()) {
 						transferToFollowerCh <- reply.Term
 					}
 				}(peer)
@@ -631,10 +672,10 @@ func (r *Raft) runLeader() {
 		}
 	}()
 
-	for r.state.getState() == Leader {
+	for r.raftState.getState() == Leader {
 		select {
 		case term := <-transferToFollowerCh:
-			r.Info("find higher term, leader(%d) -> follower(%d\n", r.state.getCurrentTerm(), term)
+			r.Info("find higher term, leader(%d) -> follower(%d\n", r.raftState.getCurrentTerm(), term)
 			r.setState(Follower)
 			r.setCurrentTerm(uint64(term))
 			return
@@ -642,22 +683,28 @@ func (r *Raft) runLeader() {
 			return
 		case rpc := <-r.rpcCh:
 			r.processRPC(rpc)
+		case lf := <-r.logCh:
+			l := lf.log
+			// Append
+			r.pushLogToLocal(l)
+			r.setLastLog(l.index, l.term)
+			lf.respCh <- true
 		}
 	}
 }
 
 func (r *Raft) setState(state RaftState) {
 	if r.debug {
-		r.Debug("state: %s -> %s\n", r.state.getState().String(), state.String())
+		r.Debug("state: %s -> %s\n", r.raftState.getState().String(), state.String())
 	}
-	r.state.setState(state)
+	r.raftState.setState(state)
 }
 
 func (r *Raft) setCurrentTerm(term uint64) {
 	if r.debug {
-		r.Debug("term: %d -> %d\n", r.state.getCurrentTerm(), term)
+		r.Debug("term: %d -> %d\n", r.raftState.getCurrentTerm(), term)
 	}
-	r.state.setCurrentTerm(term)
+	r.raftState.setCurrentTerm(term)
 }
 
 //
@@ -680,15 +727,21 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	// States
-	r.state = &raftState{}
-	r.setCurrentTerm(0)
-	r.state.setCommitIndex(0)
-	r.state.setLastApplied(0)
-	r.state.setLastSnapshot(0, 0)
-	r.state.setLastLog(0, 0)
-	r.setState(Follower)
-	r.state.SetLastVoteFor(-1)
-	r.state.SetLastVoteTerm(0)
+	r.raftState = raftState{
+		currentTerm:       0,
+		commitIndex:       0,
+		lastApplied:       0,
+		lastSnapshotIndex: 0,
+		lastSnapshotTerm:  0,
+		lastLogIndex:      0,
+		lastLogTerm:       0,
+		state:             Follower,
+		lastVoteFor:       -1,
+		lastVoteTerm:      0,
+		nextIndex:         make([]uint64, len(peers)),
+		matchIndex:        make([]uint64, len(peers)),
+	}
+
 	r.leaderId = -1
 
 	// Debug
@@ -701,6 +754,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Channels
 	r.rpcCh = make(chan RPC, 3)
 	r.killCh = make(chan struct{}, 1)
+	r.applyCh = applyCh
+	r.logCh = make(chan *LogEntry)
 
 	// initialize from state persisted before a crash
 	r.readPersist(persister.ReadRaftState())
