@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 
+	"errors"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -624,36 +625,73 @@ func (r *Raft) runCandidate() {
 	}
 }
 
-func (r *Raft) setupLeader() {
+var (
+	ErrorSendToMe      = errors.New("Send to me.")
+	ErrorInvalidServer = errors.New("Invalid server id.")
+)
+
+// newAppendEntriesArgs build AppendEntries RPC request according to the target server.
+func (r *Raft) newAppendEntriesArgs(server int, isHeartbeat bool) (args *AppendEntriesArgs, err error) {
+	if server == r.me {
+		err = ErrorSendToMe
+		return
+	}
+
+	if server == -1 && isHeartbeat {
+		args = &AppendEntriesArgs{
+			Term:     int(r.raftState.getCurrentTerm()),
+			LeaderId: r.me,
+			Entries:  nil,
+		}
+		return
+	}
+
+	if server < 0 || server >= len(r.peers) {
+		err = ErrorInvalidServer
+		return
+	}
+
+	r.lastLock.Lock()
+	defer r.lastLock.Unlock()
+
+	args = &AppendEntriesArgs{
+		Term:         int(r.getCurrentTerm()),
+		LeaderId:     r.me,
+		LeaderCommit: r.commitIndex,
+	}
+	if r.nextIndex[server] > 1 {
+		prevLog := r.logEntries[r.nextIndex[server]-1]
+		args.PrevLogIndex = prevLog.Index
+		args.PrevLogTerm = prevLog.Term
+		args.Entries = r.logEntries[r.nextIndex[server]:]
+	}
+
+	return
+}
+
+func (r *Raft) setupLeader() (transferToFollowerCh chan int, closeTransferToFollowerCh func()) {
 	for i := range r.peers {
 		r.nextIndex[i] = r.lastLogIndex + 1
 		r.matchIndex[i] = 0
 	}
 	r.leaderId = r.me
-}
 
-func (r *Raft) runLeader() {
-	r.Debug("runLeader")
-
-	// Reinitialize
-	r.setupLeader()
-
-	// transferToFollowerCh will not be closed until stillLeader becomes false
+	// transferToFollowerCh will not be closed until stillLeader becomes false.
 	stillLeader := true
 	stillLeaderMutex := sync.Mutex{}
-	transferToFollowerCh := make(chan int, 1)
+	transferToFollowerCh = make(chan int, 1)
 
 	// Close the channel.
-	defer func() {
+	closeTransferToFollowerCh = func() {
 		stillLeaderMutex.Lock()
 		defer stillLeaderMutex.Unlock()
 
 		close(transferToFollowerCh)
 		stillLeader = false
-	}()
+	}
 
-	// Send heartbeats.
-	go func() {
+	// Lambda function for sending AppendEntries RPC periodically.
+	sendAppendEntriesRPC := func(newArgs func(server int) (*AppendEntriesArgs, error)) {
 		for {
 			stillLeaderMutex.Lock()
 			if !stillLeader {
@@ -662,18 +700,20 @@ func (r *Raft) runLeader() {
 			}
 			stillLeaderMutex.Unlock()
 
-			args := &AppendEntriesArgs{
-				Term:         int(r.raftState.getCurrentTerm()),
-				LeaderId:     r.me,
-				PrevLogIndex: 0,
-				PrevLogTerm:  0,
-				Entries:      nil,
-				LeaderCommit: 0,
-			}
 			for peer := range r.peers {
 				if peer == r.me {
 					continue
 				}
+
+				// Build args
+				args, err := newArgs(peer)
+				if err == ErrorSendToMe {
+					continue
+				} else {
+					r.Warn(err.Error())
+				}
+
+				// Run a goroutine to send RPC
 				go func(server int) {
 					reply := &AppendEntriesReply{}
 					ok := r.sendAppendEntries(server, args, reply)
@@ -688,6 +728,34 @@ func (r *Raft) runLeader() {
 
 			time.Sleep(150 * time.Millisecond)
 		}
+	}
+
+	// Send heartbeats.
+	go func() {
+		sendAppendEntriesRPC(func(server int) (*AppendEntriesArgs, error) {
+			return r.newAppendEntriesArgs(server, true)
+		})
+	}()
+
+	// Send AppendEntries RPC.
+	go func() {
+		sendAppendEntriesRPC(func(server int) (*AppendEntriesArgs, error) {
+			return r.newAppendEntriesArgs(server, false)
+		})
+	}()
+
+	return
+}
+
+func (r *Raft) runLeader() {
+	r.Debug("runLeader")
+
+	// Reinitialize and send heartbeat periodically.
+	transferToFollowerCh, closeTransferToFollowerCh := r.setupLeader()
+
+	defer func() {
+		r.Debug("leave runLeader.")
+		closeTransferToFollowerCh()
 	}()
 
 	for r.raftState.getState() == Leader {
