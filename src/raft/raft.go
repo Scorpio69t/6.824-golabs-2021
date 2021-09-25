@@ -654,16 +654,14 @@ func (r *Raft) newAppendEntriesArgs(server int, isHeartbeat bool) (args *AppendE
 	r.lastLock.Lock()
 	defer r.lastLock.Unlock()
 
+	prevLog := r.logEntries[r.nextIndex[server]-1]
 	args = &AppendEntriesArgs{
 		Term:         int(r.getCurrentTerm()),
 		LeaderId:     r.me,
 		LeaderCommit: r.commitIndex,
-	}
-	if r.nextIndex[server] > 1 {
-		prevLog := r.logEntries[r.nextIndex[server]-1]
-		args.PrevLogIndex = prevLog.Index
-		args.PrevLogTerm = prevLog.Term
-		args.Entries = r.logEntries[r.nextIndex[server]:]
+		PrevLogIndex: prevLog.Index,
+		PrevLogTerm:  prevLog.Term,
+		Entries:      r.logEntries[r.nextIndex[server]:],
 	}
 
 	return
@@ -827,7 +825,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		nextIndex:         make([]uint64, len(peers)),
 		matchIndex:        make([]uint64, len(peers)),
 	}
-
+	// We need a dummy entry for convenience.
+	r.logEntries = []*LogEntry{{
+		Index: 0,
+		Term:  0,
+	}}
 	r.leaderId = -1
 
 	// Debug
