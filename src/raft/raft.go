@@ -316,7 +316,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (r *Raft) appendEntries(rpc RPC, args *AppendEntriesArgs) {
-	// TODO: 2B
 	// Defer return rpc.
 	resp := &AppendEntriesReply{
 		Term:    int(r.raftState.getCurrentTerm()),
@@ -327,11 +326,20 @@ func (r *Raft) appendEntries(rpc RPC, args *AppendEntriesArgs) {
 		rpc.Response(resp, err)
 	}()
 
-	if r.raftState.getCurrentTerm() > uint64(args.Term) {
-		r.Debug("RPC: appendEntries: receive older term\n")
-		return
+	newAppended := []*LogEntry{}
+	updateLastLog := func() {
+		newLastLog := r.logEntries[len(r.logEntries)-1]
+		r.lastLogIndex = newLastLog.Index
+		r.lastLogTerm = newLastLog.Term
 	}
 
+	// Discover older leader, return directly.
+	if r.raftState.getCurrentTerm() > uint64(args.Term) {
+		r.Debug("RPC: appendEntries: receive older term\n")
+		goto FAILED
+	}
+
+	// Discover newer leader, convert to follower.
 	if r.me != args.LeaderId && (r.raftState.getCurrentTerm() < uint64(args.Term) || r.raftState.getState() != Follower) {
 		r.Debug("RPC: appendEntries: find new leader: leader=%d, term=%d\n", args.LeaderId, args.Term)
 		r.setState(Follower)
@@ -339,11 +347,69 @@ func (r *Raft) appendEntries(rpc RPC, args *AppendEntriesArgs) {
 		resp.Term = args.Term
 	}
 
-	// Success
-	r.Debug("RPC: appendEntries: success\n")
+	// This RPC is valid, update r.lastContact and r.leaderId.
 	r.SetLastContact()
 	r.leaderId = args.LeaderId
+
+	// Heartbeat
+	if args.Entries == nil {
+		goto SUCCESS
+	}
+
+	// Real AppendEntries RPC
+	r.lastLock.Lock()
+	defer r.lastLock.Unlock()
+
+	// Doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm.
+	if r.lastLogIndex < args.PrevLogIndex {
+		goto FAILED
+	}
+	if r.logEntries[args.PrevLogIndex].Term != args.PrevLogTerm {
+		// Delete conflict entries.
+		r.logEntries = r.logEntries[:args.PrevLogIndex]
+		updateLastLog()
+		goto FAILED
+	}
+
+	// Append any new entries not already in the log.
+	for i, newEntry := range args.Entries {
+		if r.lastLogIndex >= newEntry.Index {
+			if r.logEntries[r.lastLogIndex].Term != newEntry.Term {
+				// Find conflict logs. Delete conflict logs and do not append any entries.
+				r.logEntries = r.logEntries[:newEntry.Index]
+				updateLastLog()
+				goto SUCCESS
+			} else {
+				// Skip duplicated logs.
+				continue
+			}
+		} else {
+			// No conflict entries found. Append new entries.
+			newAppended = args.Entries[i:]
+			break
+		}
+	}
+	r.logEntries = append(r.logEntries, newAppended...)
+	updateLastLog()
+
+	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+	if r.getCommitIndex() < args.LeaderCommit {
+		if args.LeaderCommit < r.lastLogIndex {
+			r.commitIndex = args.LeaderCommit
+		} else {
+			r.commitIndex = r.lastLogIndex
+		}
+	}
+
+SUCCESS:
+	r.Debug("RPC: appendEntries: success\n")
 	resp.Success = true
+	return
+
+FAILED:
+	r.Debug("RPC: appendEntries: failed\n")
+	resp.Success = false
+	return
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -462,7 +528,7 @@ func (rf *Raft) killed() bool {
 
 // run is a long running goroutine.
 func (r *Raft) run() {
-	r.Debug("run")
+	r.Debug("run\n")
 	for !r.killed() {
 		select {
 		case <-r.killCh:
@@ -490,7 +556,7 @@ func (r *Raft) run() {
 
 func (r *Raft) runFollower() {
 	// TODO: 2A
-	r.Debug("runFollower")
+	r.Debug("runFollower\n")
 	heartbeatTimer := randomTimeout(time.Millisecond * 150)
 
 	// A long loop for follower.
@@ -573,13 +639,13 @@ func (r *Raft) setupCandidate() (voteCh chan *RequestVoteReply, setDone func()) 
 }
 
 func (r *Raft) runCandidate() {
-	r.Debug("runCandidate")
+	r.Debug("runCandidate\n")
 	r.Info("start election: term=%d\n", r.raftState.getCurrentTerm())
 	electionTimeout := randomTimeout(time.Millisecond * 2000)
 
 	voteCh, setDone := r.setupCandidate()
 	defer func() {
-		r.Debug("leave candidate state.")
+		r.Debug("leave candidate state.\n")
 		setDone()
 	}()
 
@@ -746,13 +812,13 @@ func (r *Raft) setupLeader() (transferToFollowerCh chan int, closeTransferToFoll
 }
 
 func (r *Raft) runLeader() {
-	r.Debug("runLeader")
+	r.Debug("runLeader\n")
 
 	// Reinitialize and send heartbeat periodically.
 	transferToFollowerCh, closeTransferToFollowerCh := r.setupLeader()
 
 	defer func() {
-		r.Debug("leave runLeader.")
+		r.Debug("leave runLeader\n")
 		closeTransferToFollowerCh()
 	}()
 
