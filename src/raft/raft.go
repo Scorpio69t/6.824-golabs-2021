@@ -360,7 +360,7 @@ func (r *Raft) appendEntries(rpc RPC, args *AppendEntriesArgs) {
 	r.lastLock.Lock()
 	defer r.lastLock.Unlock()
 
-	// Doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm.
+	// Doesn’t contain an entry at prevLogIndex who·se term matches prevLogTerm.
 	if r.lastLogIndex < args.PrevLogIndex {
 		goto FAILED
 	}
@@ -692,18 +692,21 @@ func (r *Raft) runCandidate() {
 }
 
 var (
-	ErrorSendToMe      = errors.New("Send to me.")
-	ErrorInvalidServer = errors.New("Invalid server id.")
+	ErrorSendToMe         = errors.New("Send to me.")
+	ErrorInvalidServer    = errors.New("Invalid server id.")
+	ErrorFollowerUpToDate = errors.New("Follower up to date.")
 )
 
 // newAppendEntriesArgs build AppendEntries RPC request according to the target server.
 func (r *Raft) newAppendEntriesArgs(server int, isHeartbeat bool) (args *AppendEntriesArgs, err error) {
+	// Send to self
 	if server == r.me {
 		err = ErrorSendToMe
 		return
 	}
 
-	if server == -1 && isHeartbeat {
+	// Send heartbeat
+	if isHeartbeat {
 		args = &AppendEntriesArgs{
 			Term:     int(r.raftState.getCurrentTerm()),
 			LeaderId: r.me,
@@ -712,6 +715,7 @@ func (r *Raft) newAppendEntriesArgs(server int, isHeartbeat bool) (args *AppendE
 		return
 	}
 
+	// Invalid server
 	if server < 0 || server >= len(r.peers) {
 		err = ErrorInvalidServer
 		return
@@ -720,6 +724,13 @@ func (r *Raft) newAppendEntriesArgs(server int, isHeartbeat bool) (args *AppendE
 	r.lastLock.Lock()
 	defer r.lastLock.Unlock()
 
+	// Not necessary to replica log entries.
+	if r.lastLogIndex < r.nextIndex[server] {
+		err = ErrorFollowerUpToDate
+		return
+	}
+
+	// Valid AppendEntries RPC.
 	prevLog := r.logEntries[r.nextIndex[server]-1]
 	args = &AppendEntriesArgs{
 		Term:         int(r.getCurrentTerm()),
@@ -771,7 +782,8 @@ func (r *Raft) setupLeader() (transferToFollowerCh chan int, closeTransferToFoll
 
 				// Build args
 				args, err := newArgs(peer)
-				if err == ErrorSendToMe {
+				if err == ErrorSendToMe || err == ErrorFollowerUpToDate {
+					r.Info(err.Error())
 					continue
 				} else {
 					r.Warn(err.Error())
@@ -814,7 +826,7 @@ func (r *Raft) setupLeader() (transferToFollowerCh chan int, closeTransferToFoll
 func (r *Raft) runLeader() {
 	r.Debug("runLeader\n")
 
-	// Reinitialize and send heartbeat periodically.
+	// Reinitialize and send AppendEntries RPC periodically.
 	transferToFollowerCh, closeTransferToFollowerCh := r.setupLeader()
 
 	defer func() {
