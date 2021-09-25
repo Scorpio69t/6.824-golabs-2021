@@ -3,29 +3,29 @@ package raft
 import "sync/atomic"
 
 type LogEntry struct {
-	index   uint64
-	term    uint64
-	command interface{}
+	Index   uint64
+	Term    uint64
+	Command interface{}
 }
 
-func (l *LogEntry) Index() uint64 {
-	return atomic.LoadUint64(&l.index)
+func (l *LogEntry) GetIndex() uint64 {
+	return atomic.LoadUint64(&l.Index)
 }
 
-func (l *LogEntry) Term() uint64 {
-	return atomic.LoadUint64(&l.term)
+func (l *LogEntry) GetTerm() uint64 {
+	return atomic.LoadUint64(&l.Term)
 }
 
-func (l *LogEntry) Command() interface{} {
-	return l.command
+func (l *LogEntry) GetCommand() interface{} {
+	return l.Command
 }
 
 func (l *LogEntry) SetIndex(val uint64) {
-	atomic.StoreUint64(&l.index, val)
+	atomic.StoreUint64(&l.Index, val)
 }
 
 func (l *LogEntry) SetTerm(val uint64) {
-	atomic.StoreUint64(&l.term, val)
+	atomic.StoreUint64(&l.Term, val)
 }
 
 type LogFuture struct {

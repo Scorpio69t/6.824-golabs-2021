@@ -419,9 +419,9 @@ func (r *Raft) Start(command interface{}) (index int, term int, isLeader bool) {
 	// Send new entry to r.logCh
 	logFuture := &LogFuture{
 		log: &LogEntry{
-			term:    uint64(term),
-			index:   uint64(index),
-			command: command,
+			Term:    uint64(term),
+			Index:   uint64(index),
+			Command: command,
 		},
 		respCh: make(chan bool),
 	}
@@ -522,29 +522,19 @@ func (r *Raft) runFollower() {
 
 }
 
-func (r *Raft) runCandidate() {
-	r.Debug("runCandidate")
-	r.Info("start election: term=%d\n", r.raftState.getCurrentTerm())
-	electionTimeout := randomTimeout(time.Millisecond * 2000)
-
+func (r *Raft) setupCandidate() (voteCh chan *RequestVoteReply, setDone func()) {
 	// Vote channel.
-	voteCh := make(chan *RequestVoteReply, 5)
+	voteCh = make(chan *RequestVoteReply, 5)
 	done := false
 	doneMutex := sync.Mutex{}
-	defer func() {
+
+	// Lambda function for finishing the round of election.
+	setDone = func() {
 		doneMutex.Lock()
-		defer func() {
-			doneMutex.Unlock()
-			r.Debug("leave runCandidate")
-		}()
-
-		close(voteCh)
+		defer doneMutex.Unlock()
 		done = true
-	}()
-
-	// Votes counter.
-	grantedVotes := 0
-	neededVotes := (len(r.peers) + 1) / 2
+		close(voteCh)
+	}
 
 	// Vote for self.
 	voteCh <- &RequestVoteReply{
@@ -577,6 +567,24 @@ func (r *Raft) runCandidate() {
 			doneMutex.Unlock()
 		}(peer)
 	}
+
+	return
+}
+
+func (r *Raft) runCandidate() {
+	r.Debug("runCandidate")
+	r.Info("start election: term=%d\n", r.raftState.getCurrentTerm())
+	electionTimeout := randomTimeout(time.Millisecond * 2000)
+
+	voteCh, setDone := r.setupCandidate()
+	defer func() {
+		r.Debug("leave candidate state.")
+		setDone()
+	}()
+
+	// Votes counter.
+	grantedVotes := 0
+	neededVotes := (len(r.peers) + 1) / 2
 
 	// A long loop for waiting votes.
 	for r.raftState.getState() == Candidate {
@@ -616,8 +624,19 @@ func (r *Raft) runCandidate() {
 	}
 }
 
+func (r *Raft) setupLeader() {
+	for i := range r.peers {
+		r.nextIndex[i] = r.lastLogIndex + 1
+		r.matchIndex[i] = 0
+	}
+	r.leaderId = r.me
+}
+
 func (r *Raft) runLeader() {
 	r.Debug("runLeader")
+
+	// Reinitialize
+	r.setupLeader()
 
 	// transferToFollowerCh will not be closed until stillLeader becomes false
 	stillLeader := true
@@ -644,9 +663,8 @@ func (r *Raft) runLeader() {
 			stillLeaderMutex.Unlock()
 
 			args := &AppendEntriesArgs{
-				Term:     int(r.raftState.getCurrentTerm()),
-				LeaderId: r.me,
-				// TODO: 2B
+				Term:         int(r.raftState.getCurrentTerm()),
+				LeaderId:     r.me,
 				PrevLogIndex: 0,
 				PrevLogTerm:  0,
 				Entries:      nil,
@@ -687,7 +705,7 @@ func (r *Raft) runLeader() {
 			l := lf.log
 			// Append
 			r.pushLogToLocal(l)
-			r.setLastLog(l.index, l.term)
+			r.setLastLog(l.Index, l.Term)
 			lf.respCh <- true
 		}
 	}
@@ -728,7 +746,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	// States
 	r.raftState = raftState{
-		currentTerm:       0,
+		currentTerm:       1,
 		commitIndex:       0,
 		lastApplied:       0,
 		lastSnapshotIndex: 0,
@@ -755,7 +773,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	r.rpcCh = make(chan RPC, 3)
 	r.killCh = make(chan struct{}, 1)
 	r.applyCh = applyCh
-	r.logCh = make(chan *LogEntry)
+	r.logCh = make(chan *LogFuture)
 
 	// initialize from state persisted before a crash
 	r.readPersist(persister.ReadRaftState())
