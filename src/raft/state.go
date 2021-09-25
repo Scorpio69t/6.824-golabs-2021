@@ -77,8 +77,11 @@ type raftState struct {
 	lastVoteFor  int32
 
 	// Leader state
-	nextIndex []uint64
+	nextIndex  []uint64
 	matchIndex []uint64
+
+	// RW lock for protecting nextIndex, commitIndex, and matchIndex.
+	indexLock sync.RWMutex
 }
 
 func (r *raftState) LastVoteTerm() uint64 {

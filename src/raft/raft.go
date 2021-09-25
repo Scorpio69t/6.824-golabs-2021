@@ -299,8 +299,9 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	FollowerId int
+	Term       int
+	Success    bool
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -723,6 +724,8 @@ func (r *Raft) newAppendEntriesArgs(server int, isHeartbeat bool) (args *AppendE
 
 	r.lastLock.Lock()
 	defer r.lastLock.Unlock()
+	r.indexLock.RLock()
+	defer r.indexLock.RUnlock()
 
 	// Not necessary to replica log entries.
 	if r.lastLogIndex < r.nextIndex[server] {
@@ -744,38 +747,46 @@ func (r *Raft) newAppendEntriesArgs(server int, isHeartbeat bool) (args *AppendE
 	return
 }
 
-func (r *Raft) setupLeader() (transferToFollowerCh chan int, closeTransferToFollowerCh func()) {
+type appendEntriesReplyWrapper struct {
+	followerId int
+	reply      *AppendEntriesReply
+}
+
+func (r *Raft) setupLeader() (appendEntriesReplyCh chan *appendEntriesReplyWrapper, closeAppendEntriesReplyCh func()) {
 	for i := range r.peers {
 		r.nextIndex[i] = r.lastLogIndex + 1
 		r.matchIndex[i] = 0
 	}
 	r.leaderId = r.me
+	r.commitIndex = 0
 
 	// transferToFollowerCh will not be closed until stillLeader becomes false.
 	stillLeader := true
 	stillLeaderMutex := sync.Mutex{}
-	transferToFollowerCh = make(chan int, 1)
+	getStillLeader := func() bool {
+		stillLeaderMutex.Lock()
+		defer stillLeaderMutex.Unlock()
+		return stillLeader
+	}
+	appendEntriesReplyCh = make(chan *appendEntriesReplyWrapper)
 
-	// Close the channel.
-	closeTransferToFollowerCh = func() {
+	// Lambda for closing the reply channel.
+	closeAppendEntriesReplyCh = func() {
 		stillLeaderMutex.Lock()
 		defer stillLeaderMutex.Unlock()
 
-		close(transferToFollowerCh)
+		close(appendEntriesReplyCh)
 		stillLeader = false
 	}
 
-	// Lambda function for sending AppendEntries RPC periodically.
-	sendAppendEntriesRPC := func(newArgs func(server int) (*AppendEntriesArgs, error)) {
-		for {
-			stillLeaderMutex.Lock()
-			if !stillLeader {
-				stillLeaderMutex.Unlock()
-				return
-			}
-			stillLeaderMutex.Unlock()
-
+	// Lambda for sending AppendEntries RPC periodically.
+	sendAppendEntriesRPC := func(
+		newArgs func(server int) (*AppendEntriesArgs, error),
+		replyHandler func(reply *appendEntriesReplyWrapper),
+	) {
+		for getStillLeader() {
 			for peer := range r.peers {
+				// Skip me.
 				if peer == r.me {
 					continue
 				}
@@ -796,8 +807,11 @@ func (r *Raft) setupLeader() (transferToFollowerCh chan int, closeTransferToFoll
 
 					stillLeaderMutex.Lock()
 					defer stillLeaderMutex.Unlock()
-					if stillLeader && ok && reply.Term > int(r.raftState.getCurrentTerm()) {
-						transferToFollowerCh <- reply.Term
+					if stillLeader && ok {
+						replyHandler(&appendEntriesReplyWrapper{
+							followerId: server,
+							reply:      reply,
+						})
 					}
 				}(peer)
 			}
@@ -808,16 +822,96 @@ func (r *Raft) setupLeader() (transferToFollowerCh chan int, closeTransferToFoll
 
 	// Send heartbeats.
 	go func() {
-		sendAppendEntriesRPC(func(server int) (*AppendEntriesArgs, error) {
-			return r.newAppendEntriesArgs(server, true)
-		})
+		sendAppendEntriesRPC(
+			func(server int) (*AppendEntriesArgs, error) {
+				// Build heartbeat args.
+				return r.newAppendEntriesArgs(server, true)
+			},
+			func(reply *appendEntriesReplyWrapper) {
+				// Send reply to appendEntriesReplyCh only if finding newer term.
+				if reply.reply.Term > int(r.getCurrentTerm()) {
+					appendEntriesReplyCh <- reply
+				}
+			})
 	}()
 
 	// Send AppendEntries RPC.
 	go func() {
-		sendAppendEntriesRPC(func(server int) (*AppendEntriesArgs, error) {
-			return r.newAppendEntriesArgs(server, false)
-		})
+		sendAppendEntriesRPC(
+			func(server int) (*AppendEntriesArgs, error) {
+				// Build actual AppendEntries args.
+				return r.newAppendEntriesArgs(server, false)
+			},
+			func(reply *appendEntriesReplyWrapper) {
+				// Always send reply to appendEntriesReplyCh.
+				appendEntriesReplyCh <- reply
+			},
+		)
+	}()
+
+	// Update commitIndex periodically.
+	go func() {
+		for getStillLeader() {
+			// For each N, where N is in [commitIndex + 1, lastIndex], and log[N].Term == currentTerm,
+			// we set commitIndex = N if a majority of matchIndex[i] >= N.
+			// ? TODO: Should r.lastLock be accquired?
+			var newCommitIndex uint64 = 0
+			neededMatch := (len(r.peers) + 1) / 2
+
+			// We use binary search to find N.
+			r.indexLock.RLock()
+			left := r.commitIndex + 1
+			right := r.getLastIndex()
+			for left <= right {
+				mid := left + (right-left)/2
+				// Check term.
+				if r.logEntries[mid].Term > r.getCurrentTerm() {
+					r.Error("Goroutine::UpdateCommitIndex(): newer term is found.")
+					r.indexLock.Unlock()
+					return
+				}
+				if r.logEntries[mid].Term < r.getCurrentTerm() {
+					left = mid + 1
+					continue
+				}
+
+				// Count matched.
+				matched := 0
+				for _, mi := range r.matchIndex {
+					if mi >= mid {
+						matched++
+					}
+				}
+				if matched >= neededMatch {
+					newCommitIndex = max(newCommitIndex, mid)
+					left = mid + 1
+				} else {
+					right = mid - 1
+				}
+			}
+			r.indexLock.RUnlock()
+
+			// Update r.commitIndex.
+			if newCommitIndex != 0 {
+				r.indexLock.Lock()
+				r.Info("apply entries: [%d, %d]\n", r.commitIndex+1, newCommitIndex)
+				r.commitIndex = newCommitIndex
+				r.indexLock.Unlock()
+				for i := r.commitIndex + 1; i <= newCommitIndex; i++ {
+					r.applyCh <- ApplyMsg{
+						CommandValid:  true,
+						Command:       r.logEntries[i].Command,
+						CommandIndex:  int(i),
+						SnapshotValid: false,
+						Snapshot:      []byte{},
+						SnapshotTerm:  0,
+						SnapshotIndex: 0,
+					}
+				}
+			}
+
+			time.Sleep(300 * time.Millisecond)
+		}
 	}()
 
 	return
@@ -827,20 +921,37 @@ func (r *Raft) runLeader() {
 	r.Debug("runLeader\n")
 
 	// Reinitialize and send AppendEntries RPC periodically.
-	transferToFollowerCh, closeTransferToFollowerCh := r.setupLeader()
+	appendEntriesReplyCh, closeAppendEntriesReplyCh := r.setupLeader()
 
 	defer func() {
 		r.Debug("leave runLeader\n")
-		closeTransferToFollowerCh()
+		closeAppendEntriesReplyCh()
 	}()
 
 	for r.raftState.getState() == Leader {
 		select {
-		case term := <-transferToFollowerCh:
-			r.Info("find higher term, leader(%d) -> follower(%d\n", r.raftState.getCurrentTerm(), term)
-			r.setState(Follower)
-			r.setCurrentTerm(uint64(term))
-			return
+		case wrapper := <-appendEntriesReplyCh:
+			reply := wrapper.reply
+			// Discover newer term, convert to follower.
+			if reply.Term > int(r.getCurrentTerm()) {
+				r.Info("find higher term, leader(%d) -> follower(%d)\n", r.raftState.getCurrentTerm(), reply.Term)
+				r.setState(Follower)
+				r.setCurrentTerm(uint64(reply.Term))
+				return
+			}
+
+			fid := wrapper.followerId
+			r.indexLock.Lock()
+			if reply.Success {
+				// Update nextIndex and matchIndex.
+				r.matchIndex[fid] = r.nextIndex[fid] - 1 // prevLogIndex
+				r.nextIndex[fid] = r.getLastIndex() + 1
+			} else {
+				// Decrement nextIndex.
+				r.nextIndex[fid]--
+			}
+			r.indexLock.Unlock()
+
 		case <-r.killCh:
 			return
 		case rpc := <-r.rpcCh:
@@ -850,6 +961,9 @@ func (r *Raft) runLeader() {
 			// Append
 			r.pushLogToLocal(l)
 			r.setLastLog(l.Index, l.Term)
+			r.indexLock.Lock()
+			r.matchIndex[r.me] = l.Index
+			r.indexLock.Unlock()
 			lf.respCh <- true
 		}
 	}
