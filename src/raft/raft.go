@@ -311,7 +311,7 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	session := uuid.NewString()
 	var t string
-	if args.Entries == nil {
+	if args.Entries == nil && args.LeaderCommit == 0 {
 		t = "Heartbeat"
 		rf.Trace("RPC: %s(%s): called: leader=%d, term=%d, prevLogIndex=%d, leaderCommit=%d\n",
 			t, session, args.LeaderId, args.Term, args.PrevLogIndex, args.LeaderCommit)
@@ -343,19 +343,18 @@ func (r *Raft) appendEntries(rpc RPC, args *AppendEntriesArgs) {
 		rpc.Response(resp, err)
 	}()
 
-	newEntries := []*LogEntry{}
 	updateLastLog := func() {
 		newLastLog := r.logEntries[len(r.logEntries)-1]
 		r.lastLogIndex = newLastLog.Index
 		r.lastLogTerm = newLastLog.Term
 		r.Info("RPC: appendEntries: updateLastLog: index=%d, term=%d\n", newLastLog.Index, newLastLog.Term)
 	}
-	oldCommitIndex := r.getCommitIndex()
 
 	// Discover older leader, return directly.
 	if r.raftState.getCurrentTerm() > uint64(args.Term) {
 		r.Warn("RPC: appendEntries: receive older term\n")
-		goto FAILED
+		// Reply false.
+		return
 	}
 
 	// Discover newer leader, convert to follower.
@@ -371,8 +370,9 @@ func (r *Raft) appendEntries(rpc RPC, args *AppendEntriesArgs) {
 	r.leaderId = args.LeaderId
 
 	// Heartbeat
-	if args.Entries == nil {
-		goto SUCCESS
+	if args.Entries == nil && args.LeaderCommit == 0 {
+		resp.Success = true
+		return
 	}
 
 	// Actual AppendEntries RPC
@@ -382,7 +382,8 @@ func (r *Raft) appendEntries(rpc RPC, args *AppendEntriesArgs) {
 	// Doesn’t contain an entry at prevLogIndex who·se term matches prevLogTerm.
 	if r.lastLogIndex < args.PrevLogIndex {
 		r.Info("RPC: appendEntries: don't contain an entry at prevLogIndex: prevLogIndex=%d\n", args.PrevLogIndex)
-		goto FAILED
+		// Reply false.
+		return
 	}
 	if r.logEntries[args.PrevLogIndex].Term != args.PrevLogTerm {
 		// Delete conflict entries.
@@ -390,17 +391,22 @@ func (r *Raft) appendEntries(rpc RPC, args *AppendEntriesArgs) {
 			args.PrevLogIndex, r.logEntries[args.PrevLogIndex].Term, args.PrevLogTerm)
 		r.logEntries = r.logEntries[:args.PrevLogIndex]
 		updateLastLog()
-		goto FAILED
+		// Reply false.
+		return
 	}
 
 	// Append any new entries not already in the log.
+	newEntries := []*LogEntry{}
 	for i, newEntry := range args.Entries {
 		if r.lastLogIndex >= newEntry.Index {
 			if r.logEntries[r.lastLogIndex].Term != newEntry.Term {
 				// Find conflict logs. Delete conflict logs and do not append any entries.
 				r.logEntries = r.logEntries[:newEntry.Index]
 				updateLastLog()
-				goto SUCCESS
+
+				// Reply true.
+				resp.Success = true
+				return
 			} else {
 				// Skip duplicated logs.
 				continue
@@ -417,6 +423,7 @@ func (r *Raft) appendEntries(rpc RPC, args *AppendEntriesArgs) {
 	updateLastLog()
 
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+	oldCommitIndex := r.getCommitIndex()
 	if oldCommitIndex < args.LeaderCommit {
 		r.Info("RPC: appendEntries: attempt to update commitIndex\n")
 		var newCommitIndex uint64
@@ -432,14 +439,7 @@ func (r *Raft) appendEntries(rpc RPC, args *AppendEntriesArgs) {
 		}
 		r.indexLock.Unlock()
 	}
-
-SUCCESS:
 	resp.Success = true
-	return
-
-FAILED:
-	resp.Success = false
-	return
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
