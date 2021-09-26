@@ -28,7 +28,13 @@ func (l *LogEntry) SetTerm(val uint64) {
 	atomic.StoreUint64(&l.Term, val)
 }
 
-type LogFuture struct {
-	log    *LogEntry
-	respCh chan bool
+type StartCall struct {
+	command interface{}
+	respCh  chan *StartResult
+}
+
+type StartResult struct {
+	Index    uint64
+	Term     uint64
+	IsLeader bool
 }
