@@ -65,8 +65,8 @@ type Raft struct {
 	dead      int32               // set by Kill()
 
 	// Debug
-	logger log.Logger
-	debug  bool
+	logger   log.Logger
+	logLevel int
 
 	// Your data here (2A, 2B, 2C).
 	leaderId int
@@ -89,7 +89,10 @@ type Raft struct {
 	startLock sync.Mutex
 }
 
+// pushLogToLocal append a new entry to local logEntries.
+// The function is not thread-safe, and it is necessary to accquire lastLock before being called.
 func (r *Raft) pushLogToLocal(log *LogEntry) {
+	r.Info("pushToLocal: oldIndex=%d, oldTerm=%d, newIndex=%d, newTerm=%d\n", r.lastLogIndex, r.lastLogTerm, log.Index, log.Term)
 	r.logEntries = append(r.logEntries, log)
 }
 
@@ -223,9 +226,9 @@ func (r *Raft) processRPC(rpc RPC) {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	session := uuid.NewString()
-	rf.Debug("RPC: receive RequestVote(%s): candidate=%d, term=%d\n", session, args.CandidateId, args.Term)
+	rf.Debug("RPC: RequestVote(%s): called: candidate=%d, term=%d\n", session, args.CandidateId, args.Term)
 	defer func() {
-		rf.Debug("RPC: answer RequestVote(%s): candidate=%d, term=%d, granted=%d\n", session, args.CandidateId, reply.Term, reply.VoteGranted)
+		rf.Debug("RPC: RequestVote(%s): returned: candidate=%d, term=%d, granted=%d\n", session, args.CandidateId, reply.Term, reply.VoteGranted)
 	}()
 
 	response := rf.handleRPC(args)
@@ -245,7 +248,7 @@ func (r *Raft) requestVote(rpc RPC, args *RequestVoteArgs) {
 
 	// Leader already existed.
 	if r.leaderId != -1 && r.leaderId != args.CandidateId {
-		r.Warn("Leader existed. leaderId=%d, candidateId=%d", r.leaderId, args.CandidateId)
+		r.Warn("RPC requestVote: Leader existed. leaderId=%d, candidateId=%d", r.leaderId, args.CandidateId)
 		return
 	}
 
@@ -254,15 +257,16 @@ func (r *Raft) requestVote(rpc RPC, args *RequestVoteArgs) {
 		return
 	}
 
-	// Found newer term, transfer to follower and update term.
+	// Discover newer term, convert to follower and update term.
 	if args.Term > int(r.raftState.getCurrentTerm()) {
+		r.Info("RPC requestVote: discover newer term.")
 		r.setState(Follower)
 		r.setCurrentTerm(uint64(args.Term))
 	}
 
 	// Have voted in this term.
 	if r.raftState.LastVoteTerm() == uint64(args.Term) && r.raftState.LastVoteFor() != -1 {
-		r.Warn("Duplicated RequestVote, term=%d\n", args.Term)
+		r.Warn("RPC requestVote: duplicated RequestVote term, term=%d\n", args.Term)
 		if r.raftState.LastVoteFor() == int32(args.CandidateId) {
 			resp.VoteGranted = true
 		}
@@ -272,16 +276,16 @@ func (r *Raft) requestVote(rpc RPC, args *RequestVoteArgs) {
 	// Compare lastTerm and lastIndex
 	lastIndex, lastTerm := r.raftState.getLastLog()
 	if lastTerm > uint64(args.Term) {
-		r.Info("Our lastTerm is greater.\n")
+		r.Info("RPC requestVote: our lastTerm is greater.\n")
 		return
 	}
 	if lastTerm == args.LastLogTerm && lastIndex > args.LastLogIndex {
-		r.Info("Our term is equal to args's, but the lastIndex is greater.\n")
+		r.Info("RPC requestVote: our term is equal to args's, but the lastIndex is greater.\n")
 		return
 	}
 
 	// Grant vote for the candidate.
-	r.Info("Vote for candidate=%d, term=%d\n", args.CandidateId, args.Term)
+	r.Info("RPC requestVote: vote for candidate=%d, term=%d\n", args.CandidateId, args.Term)
 	resp.VoteGranted = true
 	resp.Term = args.Term
 	r.raftState.SetLastVoteTerm(r.raftState.getCurrentTerm())
@@ -306,10 +310,22 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	session := uuid.NewString()
-	rf.Debug("RPC: receive AppendEntries(%s): leader=%d, term=%d\n", session, args.LeaderId, args.Term)
-	defer func() {
-		rf.Debug("RPC: answer AppendEntries(%s): term=%d, success=%d", session, reply.Term, reply.Success)
-	}()
+	var t string
+	if args.Entries == nil {
+		t = "Heartbeat"
+		rf.Trace("RPC: %s(%s): called: leader=%d, term=%d, prevLogIndex=%d, leaderCommit=%d\n",
+			t, session, args.LeaderId, args.Term, args.PrevLogIndex, args.LeaderCommit)
+		defer func() {
+			rf.Trace("RPC: %s(%s): returned: term=%d, success=%d", t, session, reply.Term, reply.Success)
+		}()
+	} else {
+		t = "AppendEntries"
+		rf.Debug("RPC: %s(%s): called: leader=%d, term=%d, prevLogIndex=%d, leaderCommit=%d\n",
+			t, session, args.LeaderId, args.Term, args.PrevLogIndex, args.LeaderCommit)
+		defer func() {
+			rf.Debug("RPC: %s(%s): returned: term=%d, success=%d", t, session, reply.Term, reply.Success)
+		}()
+	}
 
 	response := rf.handleRPC(args)
 	reply.Success = response.Response.(*AppendEntriesReply).Success
@@ -327,22 +343,24 @@ func (r *Raft) appendEntries(rpc RPC, args *AppendEntriesArgs) {
 		rpc.Response(resp, err)
 	}()
 
-	newAppended := []*LogEntry{}
+	newEntries := []*LogEntry{}
 	updateLastLog := func() {
 		newLastLog := r.logEntries[len(r.logEntries)-1]
 		r.lastLogIndex = newLastLog.Index
 		r.lastLogTerm = newLastLog.Term
+		r.Info("RPC: appendEntries: updateLastLog: index=%d, term=%d\n", newLastLog.Index, newLastLog.Term)
 	}
+	oldCommitIndex := r.getCommitIndex()
 
 	// Discover older leader, return directly.
 	if r.raftState.getCurrentTerm() > uint64(args.Term) {
-		r.Debug("RPC: appendEntries: receive older term\n")
+		r.Warn("RPC: appendEntries: receive older term\n")
 		goto FAILED
 	}
 
 	// Discover newer leader, convert to follower.
 	if r.me != args.LeaderId && (r.raftState.getCurrentTerm() < uint64(args.Term) || r.raftState.getState() != Follower) {
-		r.Debug("RPC: appendEntries: find new leader: leader=%d, term=%d\n", args.LeaderId, args.Term)
+		r.Info("RPC: appendEntries: find new leader: leader=%d, term=%d\n", args.LeaderId, args.Term)
 		r.setState(Follower)
 		r.setCurrentTerm(uint64(args.Term))
 		resp.Term = args.Term
@@ -357,16 +375,19 @@ func (r *Raft) appendEntries(rpc RPC, args *AppendEntriesArgs) {
 		goto SUCCESS
 	}
 
-	// Real AppendEntries RPC
+	// Actual AppendEntries RPC
 	r.lastLock.Lock()
 	defer r.lastLock.Unlock()
 
 	// Doesn’t contain an entry at prevLogIndex who·se term matches prevLogTerm.
 	if r.lastLogIndex < args.PrevLogIndex {
+		r.Info("RPC: appendEntries: don't contain an entry at prevLogIndex: prevLogIndex=%d\n", args.PrevLogIndex)
 		goto FAILED
 	}
 	if r.logEntries[args.PrevLogIndex].Term != args.PrevLogTerm {
 		// Delete conflict entries.
+		r.Info("RPC: appendEntries: prevLogIndex conflict: index=%d, term=%d, expectedTerm=%d\n",
+			args.PrevLogIndex, r.logEntries[args.PrevLogIndex].Term, args.PrevLogTerm)
 		r.logEntries = r.logEntries[:args.PrevLogIndex]
 		updateLastLog()
 		goto FAILED
@@ -386,29 +407,37 @@ func (r *Raft) appendEntries(rpc RPC, args *AppendEntriesArgs) {
 			}
 		} else {
 			// No conflict entries found. Append new entries.
-			newAppended = args.Entries[i:]
+			newEntries = args.Entries[i:]
 			break
 		}
 	}
-	r.logEntries = append(r.logEntries, newAppended...)
+	for _, newEntry := range newEntries {
+		r.pushLogToLocal(newEntry)
+	}
 	updateLastLog()
 
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
-	if r.getCommitIndex() < args.LeaderCommit {
+	if oldCommitIndex < args.LeaderCommit {
+		r.Info("RPC: appendEntries: attempt to update commitIndex\n")
+		var newCommitIndex uint64
 		if args.LeaderCommit < r.lastLogIndex {
-			r.commitIndex = args.LeaderCommit
+			newCommitIndex = args.LeaderCommit
 		} else {
-			r.commitIndex = r.lastLogIndex
+			newCommitIndex = r.lastLogIndex
 		}
+		// Apply log entries in [oldCommitIndex, newCommitIndex]
+		r.indexLock.Lock()
+		for i := oldCommitIndex; i <= uint64(newCommitIndex); i++ {
+			r.apply(int(i))
+		}
+		r.indexLock.Unlock()
 	}
 
 SUCCESS:
-	r.Debug("RPC: appendEntries: success\n")
 	resp.Success = true
 	return
 
 FAILED:
-	r.Debug("RPC: appendEntries: failed\n")
 	resp.Success = false
 	return
 }
@@ -474,6 +503,9 @@ func (r *Raft) Start(command interface{}) (index int, term int, isLeader bool) {
 	// Your code here (2B).
 	r.startLock.Lock()
 	defer r.startLock.Unlock()
+	defer func() {
+		r.Debug("Start: returned. command=%v, index=%d, term=%d, isLeader=%d\n", command, index, term, isLeader)
+	}()
 
 	index = int(r.getLastIndex()) + 1
 	term = int(r.raftState.getCurrentTerm())
@@ -498,7 +530,7 @@ func (r *Raft) Start(command interface{}) (index int, term int, isLeader bool) {
 	// Wait for completing appending the log. The step is for thread-safety.
 	success := <-logFuture.respCh
 	if !success {
-		r.Warn("r.Start(): failed.")
+		r.Warn("Start: failed.")
 	}
 
 	return
@@ -529,7 +561,6 @@ func (rf *Raft) killed() bool {
 
 // run is a long running goroutine.
 func (r *Raft) run() {
-	r.Debug("run\n")
 	for !r.killed() {
 		select {
 		case <-r.killCh:
@@ -556,8 +587,7 @@ func (r *Raft) run() {
 }
 
 func (r *Raft) runFollower() {
-	// TODO: 2A
-	r.Debug("runFollower\n")
+	r.Info("runFollower: called\n")
 	heartbeatTimer := randomTimeout(time.Millisecond * 150)
 
 	// A long loop for follower.
@@ -613,11 +643,14 @@ func (r *Raft) setupCandidate() (voteCh chan *RequestVoteReply, setDone func()) 
 	r.raftState.SetLastVoteTerm(r.raftState.currentTerm)
 
 	// Send RequestVote RPC
+	r.lastLock.Lock()
+	lastLog := r.logEntries[len(r.logEntries)-1]
+	r.lastLock.Unlock()
 	args := &RequestVoteArgs{
 		Term:         int(r.raftState.getCurrentTerm()),
 		CandidateId:  r.me,
-		LastLogIndex: r.raftState.getLastIndex(),
-		LastLogTerm:  r.raftState.lastLogTerm,
+		LastLogIndex: lastLog.Index,
+		LastLogTerm:  lastLog.Term,
 	}
 	for peer := range r.peers {
 		// Skip me.
@@ -640,13 +673,12 @@ func (r *Raft) setupCandidate() (voteCh chan *RequestVoteReply, setDone func()) 
 }
 
 func (r *Raft) runCandidate() {
-	r.Debug("runCandidate\n")
-	r.Info("start election: term=%d\n", r.raftState.getCurrentTerm())
+	r.Info("runCandidate: start election: term=%d\n", r.raftState.getCurrentTerm())
 	electionTimeout := randomTimeout(time.Millisecond * 2000)
 
 	voteCh, setDone := r.setupCandidate()
 	defer func() {
-		r.Debug("leave candidate state.\n")
+		r.Debug("runCandidate: returned\n")
 		setDone()
 	}()
 
@@ -728,7 +760,7 @@ func (r *Raft) newAppendEntriesArgs(server int, isHeartbeat bool) (args *AppendE
 	defer r.indexLock.RUnlock()
 
 	// Not necessary to replica log entries.
-	if r.lastLogIndex < r.nextIndex[server] {
+	if r.lastLogIndex < r.matchIndex[server] {
 		err = ErrorFollowerUpToDate
 		return
 	}
@@ -758,7 +790,7 @@ func (r *Raft) setupLeader() (appendEntriesReplyCh chan *appendEntriesReplyWrapp
 		r.matchIndex[i] = 0
 	}
 	r.leaderId = r.me
-	r.commitIndex = 0
+	r.setCommitIndex(0)
 
 	// transferToFollowerCh will not be closed until stillLeader becomes false.
 	stillLeader := true
@@ -794,10 +826,10 @@ func (r *Raft) setupLeader() (appendEntriesReplyCh chan *appendEntriesReplyWrapp
 				// Build args
 				args, err := newArgs(peer)
 				if err == ErrorSendToMe || err == ErrorFollowerUpToDate {
-					r.Info(err.Error())
+					r.Info("Follower %d: "+err.Error(), peer)
 					continue
-				} else {
-					r.Warn(err.Error())
+				} else if err != nil {
+					r.Warn("Follower %d: "+err.Error(), peer)
 				}
 
 				// Run a goroutine to send RPC
@@ -838,9 +870,11 @@ func (r *Raft) setupLeader() (appendEntriesReplyCh chan *appendEntriesReplyWrapp
 	// Send AppendEntries RPC.
 	go func() {
 		sendAppendEntriesRPC(
-			func(server int) (*AppendEntriesArgs, error) {
+			func(server int) (args *AppendEntriesArgs, err error) {
 				// Build actual AppendEntries args.
-				return r.newAppendEntriesArgs(server, false)
+				args, err = r.newAppendEntriesArgs(server, false)
+				r.Trace("sendAppendEntries: to=%d, prevLogIndex=%d, leaderCommit=%d\n", server, args.PrevLogIndex, args.LeaderCommit)
+				return
 			},
 			func(reply *appendEntriesReplyWrapper) {
 				// Always send reply to appendEntriesReplyCh.
@@ -895,19 +929,10 @@ func (r *Raft) setupLeader() (appendEntriesReplyCh chan *appendEntriesReplyWrapp
 			if newCommitIndex != 0 {
 				r.indexLock.Lock()
 				r.Info("apply entries: [%d, %d]\n", r.commitIndex+1, newCommitIndex)
-				r.commitIndex = newCommitIndex
-				r.indexLock.Unlock()
 				for i := r.commitIndex + 1; i <= newCommitIndex; i++ {
-					r.applyCh <- ApplyMsg{
-						CommandValid:  true,
-						Command:       r.logEntries[i].Command,
-						CommandIndex:  int(i),
-						SnapshotValid: false,
-						Snapshot:      []byte{},
-						SnapshotTerm:  0,
-						SnapshotIndex: 0,
-					}
+					r.apply(int(i))
 				}
+				r.indexLock.Unlock()
 			}
 
 			time.Sleep(300 * time.Millisecond)
@@ -918,13 +943,13 @@ func (r *Raft) setupLeader() (appendEntriesReplyCh chan *appendEntriesReplyWrapp
 }
 
 func (r *Raft) runLeader() {
-	r.Debug("runLeader\n")
+	r.Info("runLeader: called\n")
 
 	// Reinitialize and send AppendEntries RPC periodically.
 	appendEntriesReplyCh, closeAppendEntriesReplyCh := r.setupLeader()
 
 	defer func() {
-		r.Debug("leave runLeader\n")
+		r.Info("runLeader: returned\n")
 		closeAppendEntriesReplyCh()
 	}()
 
@@ -970,17 +995,36 @@ func (r *Raft) runLeader() {
 }
 
 func (r *Raft) setState(state RaftState) {
-	if r.debug {
-		r.Debug("state: %s -> %s\n", r.raftState.getState().String(), state.String())
-	}
+	r.Trace("state: %s -> %s\n", r.raftState.getState().String(), state.String())
 	r.raftState.setState(state)
 }
 
 func (r *Raft) setCurrentTerm(term uint64) {
-	if r.debug {
-		r.Debug("term: %d -> %d\n", r.raftState.getCurrentTerm(), term)
-	}
+	r.Trace("term: %d -> %d\n", r.raftState.getCurrentTerm(), term)
 	r.raftState.setCurrentTerm(term)
+}
+
+// apply send ApplyMsg to applyCh.
+// The function is not thread-safe. Need to accquire indexLock before calling it.
+func (r *Raft) apply(index int) {
+	// Send message to applyCh.
+	msg := ApplyMsg{
+		CommandValid:  true,
+		Command:       r.logEntries[index].Command,
+		CommandIndex:  int(r.logEntries[index].Index),
+		SnapshotValid: false,
+		Snapshot:      []byte{},
+		SnapshotTerm:  0,
+		SnapshotIndex: index,
+	}
+	r.applyCh <- msg
+	r.Info("apply: index=%d, command=%d\n", msg.CommandIndex, msg.Command)
+
+	// Update commitIndex.
+	if r.commitIndex < uint64(index) {
+		r.commitIndex = uint64(index)
+		r.Info("apply: set commitIndex = %d\n", index)
+	}
 }
 
 //
@@ -1027,7 +1071,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Debug
 	r.logger = *log.Default()
 	r.logger.SetFlags(log.Lmicroseconds)
-	r.debug = true
+	r.logLevel = DefaultLogLevel
 
 	r.SetLastContact()
 
@@ -1048,7 +1092,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Debug
 	go func() {
 		for !r.killed() {
-			// r.Debug("lastVoteTerm=%d, voteFor=%d", r.state.LastVoteTerm(), r.state.LastVoteFor())
+			// r.Trace("lastVoteTerm=%d, voteFor=%d, commitIndex=%d\n", r.LastVoteTerm(), r.LastVoteFor(), r.getCommitIndex())
 			time.Sleep(2000 * time.Millisecond)
 		}
 	}()
