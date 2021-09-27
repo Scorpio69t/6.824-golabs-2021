@@ -14,8 +14,8 @@ func (rpc *RPC) Response(resp interface{}, err error) {
 	rpc.respCh <- RPCResponse{resp, err}
 }
 
-func MakeRPC(args interface{}, respCh chan RPCResponse) RPC {
-	return RPC{
+func NewRPC(args interface{}, respCh chan RPCResponse) *RPC {
+	return &RPC{
 		args, respCh,
 	}
 }
