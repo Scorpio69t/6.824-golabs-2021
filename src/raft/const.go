@@ -7,5 +7,5 @@ const (
 )
 
 const (
-	DefaultLogLevel = LevelInfo
+	DefaultLogLevel = LevelError
 )

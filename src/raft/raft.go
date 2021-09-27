@@ -276,7 +276,7 @@ func (r *Raft) requestVote(rpc RPC, args *RequestVoteArgs) {
 		return
 	}
 	if lastTerm == args.LastLogTerm && lastIndex > args.LastLogIndex {
-		r.Info("RPC requestVote: our term is equal to args's, but the lastIndex is greater.\n")
+		r.Info("RPC requestVote: our term is equal to that of args, but the lastIndex is greater.\n")
 		return
 	}
 
@@ -361,7 +361,8 @@ func (r *Raft) appendEntries(rpc RPC, args *AppendEntriesArgs) {
 		resp.Term = args.Term
 	}
 
-	// This RPC is valid, update r.lastContact and r.leaderId.
+	// This RPC is valid, so the follower should admit the leader.
+	// Update r.lastContact and r.leaderId.
 	r.SetLastContact()
 	r.leaderId = args.LeaderId
 
@@ -375,13 +376,17 @@ func (r *Raft) appendEntries(rpc RPC, args *AppendEntriesArgs) {
 	r.lastLock.Lock()
 	defer r.lastLock.Unlock()
 
-	// Doesn’t contain an entry at prevLogIndex who·se term matches prevLogTerm.
+	// Doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm.
 	if r.lastLogIndex < args.PrevLogIndex {
-		r.Info("RPC: appendEntries: don't contain an entry at prevLogIndex: prevLogIndex=%d\n", args.PrevLogIndex)
+		r.Info("RPC: appendEntries: do not contain an entry at prevLogIndex: prevLogIndex=%d\n", args.PrevLogIndex)
 		// Reply false.
 		return
 	}
 	if r.logEntries[args.PrevLogIndex].Term != args.PrevLogTerm {
+		// Send invalid ApplyMsg.
+		for j := int(args.PrevLogIndex); j < len(r.logEntries); j++ {
+			r.deny(j)
+		}
 		// Delete conflict entries.
 		r.Info("RPC: appendEntries: prevLogIndex conflict: index=%d, term=%d, expectedTerm=%d\n",
 			args.PrevLogIndex, r.logEntries[args.PrevLogIndex].Term, args.PrevLogTerm)
@@ -391,18 +396,31 @@ func (r *Raft) appendEntries(rpc RPC, args *AppendEntriesArgs) {
 		return
 	}
 
+	// The entry at prevLogIndex has the same term as prevLogTerm, so we will reply true below.
 	// Append any new entries not already in the log.
 	newEntries := []*LogEntry{}
 	for i, newEntry := range args.Entries {
 		if r.lastLogIndex >= newEntry.Index {
 			if r.logEntries[r.lastLogIndex].Term != newEntry.Term {
-				// Find conflict logs. Delete conflict logs and do not append any entries.
+				// Find conflict logs.
+				// Send invalid ApplyMsg.
+				for j := int(newEntry.Index); j < len(r.logEntries); j++ {
+					r.applyCh <- ApplyMsg{
+						CommandValid:  false,
+						Command:       r.logEntries[j].Command,
+						CommandIndex:  j,
+						SnapshotValid: false,
+						Snapshot:      []byte{},
+						SnapshotTerm:  0,
+						SnapshotIndex: 0,
+					}
+				}
+				// Delete r.logEntries[newEntry.Index:].
 				r.logEntries = r.logEntries[:newEntry.Index]
 				updateLastLog()
-
-				// Reply true.
-				resp.Success = true
-				return
+				// Should append entries whose index is equal or greater than newEntry.Index(conflict one).
+				newEntries = args.Entries[i:]
+				break
 			} else {
 				// Skip duplicated logs.
 				continue
@@ -585,7 +603,7 @@ func (r *Raft) runFollower() {
 			heartbeatTimer = time.After(time.Duration(heartbeatTimeout * int(time.Millisecond)))
 
 			// Success.
-			if time.Now().Sub(r.LastContact()) < time.Millisecond*time.Duration(oldTimeout ) {
+			if time.Now().Sub(r.LastContact()) < time.Millisecond*time.Duration(oldTimeout) {
 				continue
 			}
 
@@ -1021,18 +1039,18 @@ func (r *Raft) setCurrentTerm(term uint64) {
 	r.raftState.setCurrentTerm(term)
 }
 
-// apply send ApplyMsg to applyCh.
+// apply send valid ApplyMsg to applyCh.
 // The function is not thread-safe. Need to accquire indexLock before calling it.
 func (r *Raft) apply(index int) {
 	// Send message to applyCh.
 	msg := ApplyMsg{
 		CommandValid:  true,
 		Command:       r.logEntries[index].Command,
-		CommandIndex:  int(r.logEntries[index].Index),
+		CommandIndex:  index,
 		SnapshotValid: false,
 		Snapshot:      []byte{},
 		SnapshotTerm:  0,
-		SnapshotIndex: index,
+		SnapshotIndex: 0,
 	}
 	r.applyCh <- msg
 	r.Info("apply: index=%d, command=%d\n", msg.CommandIndex, msg.Command)
@@ -1042,6 +1060,22 @@ func (r *Raft) apply(index int) {
 		r.commitIndex = uint64(index)
 		r.Info("apply: set commitIndex = %d\n", index)
 	}
+}
+
+// deny send invalid ApplyMsg to applyCh.
+func (r *Raft) deny(index int) {
+	// Send message to applyCh.
+	msg := ApplyMsg{
+		CommandValid:  false,
+		Command:       r.logEntries[index].Command,
+		CommandIndex:  index,
+		SnapshotValid: false,
+		Snapshot:      []byte{},
+		SnapshotTerm:  0,
+		SnapshotIndex: 0,
+	}
+	r.applyCh <- msg
+	r.Info("deny: index=%d, command=%d\n", msg.CommandIndex, msg.Command)
 }
 
 //
