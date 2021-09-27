@@ -12,10 +12,6 @@ const (
 	LevelError
 )
 
-const (
-	DefaultLogLevel = LevelDebug
-)
-
 func (r *Raft) Warn(format string, args ...interface{}) {
 	if r.logLevel > LevelWarn {
 		return

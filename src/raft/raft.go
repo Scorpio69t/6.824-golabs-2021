@@ -439,7 +439,11 @@ func (r *Raft) appendEntries(rpc RPC, args *AppendEntriesArgs) {
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	rf.Trace("RPC: sendAppendEntries, server=%d, commitIndex=%d\n", server, args.LeaderCommit)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	if !ok {
+		rf.Warn("RPC: sendAppendEntries failed: server=%d, commitIndex=%d\n", server, args.LeaderCommit)
+	}
 	return ok
 }
 
@@ -473,10 +477,10 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	rf.Debug("RPC: sendRequestVote, server=%d\n", server)
+	rf.Debug("RPC: sendRequestVote, server=%d, term=%d\n", server, args.Term)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	if !ok {
-		rf.Warn("RPC: sendRequestVote failed.\n")
+		rf.Warn("RPC: sendRequestVote failed: server=%d, term=%d\n", server, args.Term)
 	}
 	return ok
 }
@@ -564,7 +568,8 @@ func (r *Raft) run() {
 
 func (r *Raft) runFollower() {
 	r.Info("runFollower: called\n")
-	heartbeatTimer := randomTimeout(time.Millisecond * 150)
+	heartbeatTimeout := randomTimeoutInt(followerHeartbeatMs)
+	heartbeatTimer := time.After(time.Millisecond * followerHeartbeatMs)
 
 	// A long loop for follower.
 	for r.raftState.getState() == Follower {
@@ -575,11 +580,12 @@ func (r *Raft) runFollower() {
 			r.processRPC(rpc)
 		case <-heartbeatTimer:
 			// Clear the timeout.
-			heartbeatTimeout := randomTimeoutInt((int(time.Millisecond) * 150))
-			heartbeatTimer = randomTimeout(time.Duration(heartbeatTimeout))
+			oldTimeout := heartbeatTimeout
+			heartbeatTimeout = randomTimeoutInt(followerHeartbeatMs)
+			heartbeatTimer = time.After(time.Duration(heartbeatTimeout * int(time.Millisecond)))
 
 			// Success.
-			if time.Now().Sub(r.LastContact()) < time.Millisecond*250 {
+			if time.Now().Sub(r.LastContact()) < time.Millisecond*time.Duration(oldTimeout ) {
 				continue
 			}
 
@@ -653,7 +659,7 @@ func (r *Raft) setupCandidate() (voteCh chan *RequestVoteReply, setDone func()) 
 
 func (r *Raft) runCandidate() {
 	r.Info("runCandidate: start election: term=%d\n", r.raftState.getCurrentTerm())
-	electionTimeout := randomTimeout(time.Millisecond * 2000)
+	electionTimeout := randomTimeout(time.Millisecond * electionMs)
 
 	voteCh, setDone := r.setupCandidate()
 	defer func() {
@@ -766,7 +772,7 @@ type appendEntriesReplyWrapper struct {
 	reply      *AppendEntriesReply
 }
 
-func (r *Raft) setupLeader() {
+func (r *Raft) setupLeader(lc *leaderChannels) {
 	// Reinitialize.
 	for i := range r.peers {
 		r.nextIndex[i] = r.lastLogIndex + 1
@@ -778,31 +784,37 @@ func (r *Raft) setupLeader() {
 	// Send heartbeats periodically.
 	go func() {
 		for r.getState() == Leader {
-			r.lc.mu.Lock()
-			r.lc.heartbeatTimerCh <- true
-			r.lc.mu.Unlock()
+			lc.mu.Lock()
+			if lc.isOpen {
+				lc.heartbeatTimerCh <- true
+			}
+			lc.mu.Unlock()
 
-			time.Sleep(150 * time.Millisecond)
+			time.Sleep(leaderAppendEntriesMs * time.Millisecond)
 		}
 	}()
 
 	// Send AppendEntries RPC periodically.
 	go func() {
 		for r.getState() == Leader {
-			r.lc.mu.Lock()
-			r.lc.appendEntriesTimerCh <- true
-			r.lc.mu.Unlock()
+			lc.mu.Lock()
+			if lc.isOpen {
+				lc.appendEntriesTimerCh <- true
+			}
+			lc.mu.Unlock()
 
-			time.Sleep(150 * time.Millisecond)
+			time.Sleep(leaderAppendEntriesMs * time.Millisecond)
 		}
 	}()
 
 	// Update commitIndex periodically.
 	go func() {
 		for r.getState() == Leader {
-			r.lc.mu.Lock()
-			r.lc.updateCommitIndexTimerCh <- true
-			r.lc.mu.Unlock()
+			lc.mu.Lock()
+			if lc.isOpen {
+				lc.updateCommitIndexTimerCh <- true
+			}
+			lc.mu.Unlock()
 
 			time.Sleep(300 * time.Millisecond)
 		}
@@ -812,7 +824,7 @@ func (r *Raft) setupLeader() {
 }
 
 // sendAppendEntriesToAll is called by the leader to send Heartbeat RPC to other peers.
-func (r *Raft) sendHeartbeatToAll() {
+func (r *Raft) sendHeartbeatToAll(lc *leaderChannels) {
 	for peer := range r.peers {
 		// Skip me.
 		if peer == r.me {
@@ -834,17 +846,21 @@ func (r *Raft) sendHeartbeatToAll() {
 			ok := r.sendAppendEntries(server, args, reply)
 
 			if ok && r.getState() == Leader && reply.Term > int(r.getCurrentTerm()) {
-				r.lc.replyCh <- &appendEntriesReplyWrapper{
-					followerId: server,
-					reply:      reply,
+				lc.mu.Lock()
+				if lc.isOpen {
+					lc.replyCh <- &appendEntriesReplyWrapper{
+						followerId: server,
+						reply:      reply,
+					}
 				}
+				lc.mu.Unlock()
 			}
 		}(peer)
 	}
 }
 
 // sendAppendEntriesToAll is called by the leader to send AppendEntries RPC to other peers.
-func (r *Raft) sendAppendEntriesToAll() {
+func (r *Raft) sendAppendEntriesToAll(lc *leaderChannels) {
 	for peer := range r.peers {
 		// Skip me.
 		if peer == r.me {
@@ -866,10 +882,14 @@ func (r *Raft) sendAppendEntriesToAll() {
 			ok := r.sendAppendEntries(server, args, reply)
 
 			if ok && r.getState() == Leader {
-				r.lc.replyCh <- &appendEntriesReplyWrapper{
-					followerId: server,
-					reply:      reply,
+				lc.mu.Lock()
+				if lc.isOpen {
+					lc.replyCh <- &appendEntriesReplyWrapper{
+						followerId: server,
+						reply:      reply,
+					}
 				}
+				lc.mu.Unlock()
 			}
 		}(peer)
 	}
@@ -932,18 +952,17 @@ func (r *Raft) runLeader() {
 	r.Info("runLeader: called\n")
 
 	// Reinitialize and send AppendEntries RPC periodically.
-	r.lc = newLeaderChannel()
-	r.setupLeader()
+	lc := newLeaderChannel()
+	r.setupLeader(lc)
 
 	defer func() {
 		r.Info("runLeader: returned\n")
-		r.lc.Close()
-		r.lc = nil
+		lc.Close()
 	}()
 
 	for r.raftState.getState() == Leader {
 		select {
-		case wrapper := <-r.lc.replyCh:
+		case wrapper := <-lc.replyCh:
 			reply := wrapper.reply
 			// Discover newer term, convert to follower.
 			if reply.Term > int(r.getCurrentTerm()) {
@@ -964,11 +983,11 @@ func (r *Raft) runLeader() {
 				r.nextIndex[fid]--
 			}
 			r.indexLock.Unlock()
-		case <-r.lc.heartbeatTimerCh:
-			r.sendHeartbeatToAll()
-		case <-r.lc.appendEntriesTimerCh:
-			r.sendAppendEntriesToAll()
-		case <-r.lc.updateCommitIndexTimerCh:
+		case <-lc.heartbeatTimerCh:
+			// r.sendHeartbeatToAll(lc)
+		case <-lc.appendEntriesTimerCh:
+			r.sendAppendEntriesToAll(lc)
+		case <-lc.updateCommitIndexTimerCh:
 			r.updateLeaderCommit()
 		case <-r.killCh:
 			return
