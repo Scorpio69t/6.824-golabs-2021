@@ -23,6 +23,13 @@ func max(a, b uint64) uint64 {
 	return b
 }
 
+func min(a, b uint64) uint64 {
+	if a < b {
+		return a
+	}
+	return a
+}
+
 // randomTimeout returns a value that is between the minVal and 2x minVal.
 func randomTimeout(minVal time.Duration) <-chan time.Time {
 	if minVal == 0 {
@@ -34,5 +41,5 @@ func randomTimeout(minVal time.Duration) <-chan time.Time {
 
 // randomTimeoutInt returns an integer that is between the minVal an 2x minVal
 func randomTimeoutInt(minVal int) int {
-	return minVal + int(rand.Int63() % int64(minVal))
+	return minVal + int(rand.Int63()%int64(minVal))
 }

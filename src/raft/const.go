@@ -9,3 +9,7 @@ const (
 const (
 	DefaultLogLevel = LevelNoLog
 )
+
+const (
+	maxLenNewEntries = 10
+)

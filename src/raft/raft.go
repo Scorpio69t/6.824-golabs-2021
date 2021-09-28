@@ -83,6 +83,9 @@ type Raft struct {
 	killCh  chan struct{}
 	applyCh chan ApplyMsg
 	startCh chan *StartCall
+
+	// Mutex
+	rpcMu sync.Mutex
 }
 
 // pushLogToLocal append a new entry to local logEntries.
@@ -192,40 +195,55 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
-func (r *Raft) handleRPC(args interface{}) (response RPCResponse) {
+func (r *Raft) handleRPC(args interface{}, rpcId string) (response RPCResponse) {
 	// r.Trace("RPC: handleRPC was called\n")
 	// defer r.Trace("RPC: handleRPC returned\n")
 
+	// To find out dead lock in RPC handler, we use a timer to record the time of RPC calls.
+	// If the time of calls > 3s, panic.
 	t0 := time.Now()
 	finishCh := make(chan bool)
 	go func() {
 		for {
+			t := time.Now()
 			select {
 			case <-finishCh:
+				r.Debug("handlerRPC(%s): time: %d\n", rpcId, t.Sub(t0).Milliseconds())
 				return
 			default:
-				t := time.Now()
-				if t.Sub(t0) > time.Second*3 {
-					r.Error("handleRPC: timeout\n")
+				if t.Sub(t0) > time.Second*10 {
+					r.Error("handleRPC(%s): timeout\n", rpcId)
+					// panic("handleRPC(%s): timeout\n")
 					return
 				}
 				time.Sleep(100 * time.Millisecond)
 			}
 		}
 	}()
+
+	// There may be a bug in the function.
+	// When reading or writing to r.rpcCh concurrently, r.rpcCh <- rpc may block.
+	r.rpcMu.Lock()
 	defer func() {
+		r.rpcMu.Unlock()
 		finishCh <- true
 		close(finishCh)
 	}()
 
-	respCh := make(chan RPCResponse)
-	defer close(respCh)
-	rpc := NewRPC(args, respCh)
+	rpc := &RPC{
+		Args:   args,
+		respCh: make(chan RPCResponse),
+		id:     rpcId,
+	}
+	defer close(rpc.respCh)
+
+	// We use the concurrent model based on channel, and
+	// the actual handler will excute in r.run().
 	//r.Trace("handleRPC: before sending to r.rpcCh")
 	r.rpcCh <- rpc
 	//r.Trace("handleRPC: after sending to r.rpcCh")
 
-	resp := <-respCh
+	resp := <-rpc.respCh
 	return resp
 }
 
@@ -246,13 +264,13 @@ func (r *Raft) processRPC(rpc *RPC) {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	session := uuid.NewString()
-	rf.Debug("RPC: RequestVote(%s): called: candidate=%d, term=%d\n", session, args.CandidateId, args.Term)
+	rpcId := uuid.NewString()
+	rf.Debug("RPC: RequestVote(%s): called: candidate=%d, term=%d\n", rpcId, args.CandidateId, args.Term)
 	defer func() {
-		rf.Debug("RPC: RequestVote(%s): returned: candidate=%d, term=%d, granted=%d\n", session, args.CandidateId, reply.Term, reply.VoteGranted)
+		rf.Debug("RPC: RequestVote(%s): returned: candidate=%d, term=%d, granted=%d\n", rpcId, args.CandidateId, reply.Term, reply.VoteGranted)
 	}()
 
-	response := rf.handleRPC(args)
+	response := rf.handleRPC(args, rpcId)
 	reply.Term = response.Response.(*RequestVoteReply).Term
 	reply.VoteGranted = response.Response.(*RequestVoteReply).VoteGranted
 }
@@ -329,25 +347,13 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	session := uuid.NewString()
-	var t string
-	if args.Entries == nil && args.LeaderCommit == 0 {
-		// t = "Heartbeat"
-		// rf.Trace("RPC: %s(%s): called: leader=%d, term=%d, prevLogIndex=%d, leaderCommit=%d\n",
-		//	t, session, args.LeaderId, args.Term, args.PrevLogIndex, args.LeaderCommit)
-		// defer func() {
-		//	rf.Trace("RPC: %s(%s): returned: term=%d, success=%d", t, session, reply.Term, reply.Success)
-		// }()
-	} else {
-		t = "AppendEntries"
-		rf.Debug("RPC: %s(%s): called: leader=%d, term=%d, prevLogIndex=%d, leaderCommit=%d, entries=%s\n",
-			t, session, args.LeaderId, args.Term, args.PrevLogIndex, args.LeaderCommit, formatLogEntries(args.Entries))
-		defer func() {
-			rf.Debug("RPC: %s(%s): returned: term=%d, success=%d", t, session, reply.Term, reply.Success)
-		}()
-	}
-
-	response := rf.handleRPC(args)
+	rpcId := uuid.NewString()
+	rf.Debug("RPC: AppendEntries(%s): called: leader=%d, term=%d, prevLogIndex=%d, leaderCommit=%d, entries=%s\n",
+		rpcId, args.LeaderId, args.Term, args.PrevLogIndex, args.LeaderCommit, formatLogEntries(args.Entries))
+	defer func() {
+		rf.Debug("RPC: AppendEntries(%s): returned: term=%d, success=%d", rpcId, reply.Term, reply.Success)
+	}()
+	response := rf.handleRPC(args, rpcId)
 	reply.Success = response.Response.(*AppendEntriesReply).Success
 	reply.Term = response.Response.(*AppendEntriesReply).Term
 }
@@ -405,11 +411,15 @@ func (r *Raft) appendEntries(rpc *RPC, args *AppendEntriesArgs) {
 	r.SetLastContact()
 	r.leaderId = args.LeaderId
 
-	// Actual AppendEntries RPC
+	// Operations below will read/write lastIndex, and logEntries, we need to accquire the lastLock.
 	// r.Trace("appendEntries: before r.lastLock.Lock()\n")
 	r.lastLock.Lock()
 	defer r.lastLock.Unlock()
 	// r.Trace("appendEntries: after r.lastLock.Lock()\n")
+
+	// The lastIndex or lastTerm may not up-to-date so
+	// we need to update then first.
+	r.updateLastLog()
 
 	// Do not contain an entry at prevLogIndex whose term matches prevLogTerm.
 	if r.lastLogIndex < args.PrevLogIndex {
@@ -798,21 +808,25 @@ func (r *Raft) newAppendEntriesArgs(server int, isHeartbeat bool) (args *AppendE
 	r.indexLock.RLock()
 	defer r.indexLock.RUnlock()
 
-	// Not necessary to replica log entries.
-	if r.lastLogIndex < r.matchIndex[server] {
-		err = ErrorFollowerUpToDate
-		return
-	}
-
 	// Valid AppendEntries RPC.
-	prevLog := r.logEntries[r.nextIndex[server]-1]
+	// Deep copy newEntries.
+	serverNextIndex := r.nextIndex[server]
+	end := min(uint64(len(r.logEntries)), serverNextIndex+maxLenNewEntries)
+	length := end - r.nextIndex[server]
+	nextEntries := make([]*LogEntry, length)
+	sourceEntries := r.logEntries[serverNextIndex:end]
+	for i := range nextEntries {
+		nextEntries[i] = new(LogEntry)
+		*nextEntries[i] = *sourceEntries[i]
+	}
+	prevLog := r.logEntries[serverNextIndex-1]
 	args = &AppendEntriesArgs{
 		Term:         int(r.getCurrentTerm()),
 		LeaderId:     r.me,
 		LeaderCommit: r.commitIndex,
 		PrevLogIndex: prevLog.Index,
 		PrevLogTerm:  prevLog.Term,
-		Entries:      r.logEntries[r.nextIndex[server]:],
+		Entries:      nextEntries,
 	}
 
 	return
@@ -883,10 +897,12 @@ func (r *Raft) sendHeartbeatToAll(lc *leaderChannels) {
 
 		// Build args
 		args, err := r.newAppendEntriesArgs(peer, true)
-		if err == ErrorSendToMe || err == ErrorFollowerUpToDate {
-			r.Info("Follower %d: "+err.Error(), peer)
+		switch err {
+		case ErrorSendToMe:
 			continue
-		} else if err != nil {
+		case ErrorFollowerUpToDate:
+			// Do nothing.
+		default:
 			r.Warn("Follower %d: "+err.Error(), peer)
 		}
 
@@ -919,7 +935,7 @@ func (r *Raft) sendAppendEntriesToAll(lc *leaderChannels) {
 
 		// Build args
 		args, err := r.newAppendEntriesArgs(peer, false)
-		if err == ErrorSendToMe || err == ErrorFollowerUpToDate {
+		if err == ErrorSendToMe {
 			r.Info("Follower %d: "+err.Error(), peer)
 			continue
 		} else if err != nil {
