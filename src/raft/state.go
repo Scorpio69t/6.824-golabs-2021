@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 )
@@ -75,6 +76,13 @@ type raftState struct {
 	// Vote state
 	lastVoteTerm uint64
 	lastVoteFor  int32
+
+	// Leader state
+	nextIndex  []uint64
+	matchIndex []uint64
+
+	// RW lock for protecting nextIndex, commitIndex, and matchIndex.
+	indexLock sync.RWMutex
 }
 
 func (r *raftState) LastVoteTerm() uint64 {
@@ -188,4 +196,23 @@ func (r *raftState) getLastEntry() (uint64, uint64) {
 		return r.lastLogIndex, r.lastLogTerm
 	}
 	return r.lastSnapshotIndex, r.lastSnapshotTerm
+}
+
+type leaderChannels struct {
+	ctx                      context.Context
+	cancel                   func()
+	replyCh                  chan *appendEntriesReplyWrapper
+	heartbeatTimerCh         chan bool
+	appendEntriesTimerCh     chan bool
+	updateCommitIndexTimerCh chan bool
+}
+
+func newLeaderChannel() (lc *leaderChannels) {
+	lc = new(leaderChannels)
+	lc.ctx, lc.cancel = context.WithCancel(context.TODO())
+	lc.replyCh = make(chan *appendEntriesReplyWrapper)
+	lc.heartbeatTimerCh = make(chan bool)
+	lc.appendEntriesTimerCh = make(chan bool)
+	lc.updateCommitIndexTimerCh = make(chan bool)
+	return
 }
