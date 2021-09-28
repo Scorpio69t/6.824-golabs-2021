@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 )
@@ -198,40 +199,20 @@ func (r *raftState) getLastEntry() (uint64, uint64) {
 }
 
 type leaderChannels struct {
-	mu                       sync.Mutex
+	ctx                      context.Context
+	cancel                   func()
 	replyCh                  chan *appendEntriesReplyWrapper
 	heartbeatTimerCh         chan bool
 	appendEntriesTimerCh     chan bool
 	updateCommitIndexTimerCh chan bool
-	isOpen                   bool
 }
 
 func newLeaderChannel() (lc *leaderChannels) {
 	lc = new(leaderChannels)
+	lc.ctx, lc.cancel = context.WithCancel(context.TODO())
 	lc.replyCh = make(chan *appendEntriesReplyWrapper)
 	lc.heartbeatTimerCh = make(chan bool)
 	lc.appendEntriesTimerCh = make(chan bool)
 	lc.updateCommitIndexTimerCh = make(chan bool)
-	lc.isOpen = true
 	return
-}
-
-func (lc *leaderChannels) IsOpen() (isOpen bool) {
-	lc.mu.Lock()
-	defer lc.mu.Unlock()
-	isOpen = lc.isOpen
-	return
-}
-
-func (lc *leaderChannels) Close() {
-	if !lc.IsOpen() {
-		return
-	}
-	lc.mu.Lock()
-	defer lc.mu.Unlock()
-	close(lc.appendEntriesTimerCh)
-	close(lc.heartbeatTimerCh)
-	close(lc.replyCh)
-	close(lc.updateCommitIndexTimerCh)
-	lc.isOpen = false
 }

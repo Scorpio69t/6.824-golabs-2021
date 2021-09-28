@@ -1,9 +1,10 @@
 package raft
 
 const (
-	followerHeartbeatMs   = 180
-	electionMs            = 2000
-	leaderAppendEntriesMs = 110
+	followerMinElectionTimeoutMs = 300
+	followerMaxElectionTimeoutMs = 450
+	candidateElectionMs          = 1500
+	leaderAppendEntriesMs        = 100
 )
 
 const (

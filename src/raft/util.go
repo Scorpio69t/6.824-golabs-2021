@@ -43,3 +43,8 @@ func randomTimeout(minVal time.Duration) <-chan time.Time {
 func randomTimeoutInt(minVal int) int {
 	return minVal + int(rand.Int63()%int64(minVal))
 }
+
+func randomIntBetween(minVal int, maxVal int) int {
+	diff := maxVal - minVal
+	return minVal + int(rand.Int31())%diff
+}
