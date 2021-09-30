@@ -106,19 +106,18 @@ func (r *Raft) SetLastContact() {
 	r.lastContactMutex.Unlock()
 }
 
-// return currentTerm and whether this server
+// GetState return currentTerm and whether this server
 // believes it is the leader.
-func (rf *Raft) GetState() (int, bool) {
+func (r *Raft) GetState() (int, bool) {
 	// Your code here (2A).
-	return int(rf.raftState.getCurrentTerm()), rf.raftState.getState() == Leader
+	return int(r.raftState.getCurrentTerm()), r.raftState.getState() == Leader
 }
 
-//
-// save Raft's persistent state to stable storage,
+// persist saves Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 //
-func (rf *Raft) persist() {
+func (r *Raft) persist() {
 	// Your code here (2C).
 	// Example:
 	// w := new(bytes.Buffer)
@@ -129,10 +128,9 @@ func (rf *Raft) persist() {
 	// rf.persister.SaveRaftState(data)
 }
 
+// readPersist restores previously persisted state.
 //
-// restore previously persisted state.
-//
-func (rf *Raft) readPersist(data []byte) {
+func (r *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
@@ -155,7 +153,7 @@ func (rf *Raft) readPersist(data []byte) {
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
 //
-func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
+func (r *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
 	// Your code here (2D).
 
@@ -166,13 +164,12 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
-func (rf *Raft) Snapshot(index int, snapshot []byte) {
+func (r *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 
 }
 
-//
-// example RequestVote RPC arguments structure.
+// RequestVoteArgs is the RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
@@ -183,8 +180,7 @@ type RequestVoteArgs struct {
 	LastLogTerm  uint64
 }
 
-//
-// example RequestVote RPC reply structure.
+// RequestVoteReply is the RequestVote RPC reply structure.
 // field names must start with capital letters!
 //
 type RequestVoteReply struct {
@@ -229,15 +225,15 @@ func (r *Raft) processRPC(rpc *RPC) {
 //
 // example RequestVote RPC handler.
 //
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+func (r *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rpcId := uuid.NewString()
-	rf.Debug("RPC: RequestVote(%s): called: candidate=%d, term=%d\n", rpcId, args.CandidateId, args.Term)
+	r.Debug("RPC: RequestVote(%s): called: candidate=%d, term=%d\n", rpcId, args.CandidateId, args.Term)
 	defer func() {
-		rf.Debug("RPC: RequestVote(%s): returned: candidate=%d, term=%d, granted=%d\n", rpcId, args.CandidateId, reply.Term, reply.VoteGranted)
+		r.Debug("RPC: RequestVote(%s): returned: candidate=%d, term=%d, granted=%d\n", rpcId, args.CandidateId, reply.Term, reply.VoteGranted)
 	}()
 
-	response := rf.handleRPC(args, rpcId)
+	response := r.handleRPC(args, rpcId)
 	reply.Term = response.Response.(*RequestVoteReply).Term
 	reply.VoteGranted = response.Response.(*RequestVoteReply).VoteGranted
 }
@@ -313,14 +309,14 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rpcId := uuid.NewString()
-	rf.Debug("RPC: AppendEntries(%s): called: leader=%d, term=%d, prevLogIndex=%d, leaderCommit=%d, entries=%s\n",
+	r.Debug("RPC: AppendEntries(%s): called: leader=%d, term=%d, prevLogIndex=%d, leaderCommit=%d, entries=%s\n",
 		rpcId, args.LeaderId, args.Term, args.PrevLogIndex, args.LeaderCommit, formatLogEntries(args.Entries))
 	defer func() {
-		rf.Debug("RPC: AppendEntries(%s): returned: term=%d, success=%d", rpcId, reply.Term, reply.Success)
+		r.Debug("RPC: AppendEntries(%s): returned: term=%d, success=%d", rpcId, reply.Term, reply.Success)
 	}()
-	response := rf.handleRPC(args, rpcId)
+	response := r.handleRPC(args, rpcId)
 	reply.Success = response.Response.(*AppendEntriesReply).Success
 	reply.Term = response.Response.(*AppendEntriesReply).Term
 }
@@ -441,11 +437,11 @@ func (r *Raft) appendEntries(rpc *RPC, args *AppendEntriesArgs) {
 	resp.Success = true
 }
 
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+func (r *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	// rf.Trace("RPC: sendAppendEntries, server=%d, commitIndex=%d\n", server, args.LeaderCommit)
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	ok := r.peers[server].Call("Raft.AppendEntries", args, reply)
 	if !ok {
-		rf.Warn("RPC: sendAppendEntries failed: server=%d, commitIndex=%d\n", server, args.LeaderCommit)
+		r.Warn("RPC: sendAppendEntries failed: server=%d, commitIndex=%d\n", server, args.LeaderCommit)
 	}
 	return ok
 }
@@ -479,11 +475,11 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 //
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	rf.Debug("RPC: sendRequestVote, server=%d, term=%d\n", server, args.Term)
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+func (r *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	r.Debug("RPC: sendRequestVote, server=%d, term=%d\n", server, args.Term)
+	ok := r.peers[server].Call("Raft.RequestVote", args, reply)
 	if !ok {
-		rf.Warn("RPC: sendRequestVote failed: server=%d, term=%d\n", server, args.Term)
+		r.Warn("RPC: sendRequestVote failed: server=%d, term=%d\n", server, args.Term)
 	}
 	return ok
 }
@@ -531,20 +527,20 @@ func (r *Raft) Start(command interface{}) (index int, term int, isLeader bool) {
 // confusing debug output. any goroutine with a long-running loop
 // should call killed() to check whether it should stop.
 //
-func (rf *Raft) Kill() {
-	atomic.StoreInt32(&rf.dead, 1)
+func (r *Raft) Kill() {
+	atomic.StoreInt32(&r.dead, 1)
 	// Your code here, if desired.
-	rf.Error("Kill\n")
-	rf.setState(Shutdown)
-	rf.killCh <- struct{}{}
+	r.Error("Kill\n")
+	r.setState(Shutdown)
+	r.killCh <- struct{}{}
 }
 
-func (rf *Raft) killed() bool {
-	z := atomic.LoadInt32(&rf.dead)
+func (r *Raft) killed() bool {
+	z := atomic.LoadInt32(&r.dead)
 	return z == 1
 }
 
-// run is a long running goroutine.
+// run is the main running goroutine.
 func (r *Raft) run() {
 	defer func() {
 		r.Error("run returned\n")
@@ -1042,7 +1038,18 @@ func (r *Raft) applyGoroutine() {
 	}
 }
 
-//
+// debugPrintGoroutine is a running goroutine for printing debugging information in debug mode.
+func (r *Raft) debugPrintGoroutine(interval time.Duration) {
+	if r.logLevel > LevelDebug {
+		return
+	}
+	for !r.killed() {
+		// Print something.
+		time.Sleep(interval)
+	}
+}
+
+// Make returns a raft server.
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -1083,10 +1090,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}}
 	r.leaderId = -1
 
-	// Debug
-	r.logger = *log.Default()
-	r.logger.SetFlags(log.Lmicroseconds)
-	r.logLevel = initLogLevel()
+	// Logger
+	r.logger, r.logLevel = makeLogger()
 
 	r.SetLastContact()
 
@@ -1105,18 +1110,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// go rf.ticker()
 	go r.run()
 	go r.applyGoroutine()
-
-	// Debug
-	go func() {
-		for !r.killed() {
-			// r.lastLock.Lock()
-			// r.indexLock.Lock()
-			// r.Debug("applyIndex=%d, commitIndex=%d, logEntries: %s\n", r.getLastApplied(), r.commitIndex, formatLogEntries(r.logEntries[1:]))
-			// r.indexLock.Unlock()
-			// r.lastLock.Unlock()
-			time.Sleep(500 * time.Millisecond)
-		}
-	}()
+	go r.debugPrintGoroutine(time.Millisecond * 1000)
 
 	return r
 }

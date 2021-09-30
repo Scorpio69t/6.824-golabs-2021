@@ -2,6 +2,7 @@ package raft
 
 import (
 	"fmt"
+	"log"
 	"os"
 )
 
@@ -34,11 +35,13 @@ func mapStringToLogLevel(s string) int {
 	}
 }
 
-// initLogLevel return LogLevel based on environment variable LOG_LEVEL.
+// makeLogger returns LogLevel based on environment variable LOG_LEVEL.
 // If LOG_LEVEL is not found, return DefaultLogLevel.
-func initLogLevel() int {
-	s := os.Getenv("LOG_LEVEL")
-	return mapStringToLogLevel(s)
+func makeLogger() (logger log.Logger, logLevel int) {
+	logger = *log.Default()
+	logger.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	logLevel = mapStringToLogLevel(os.Getenv("LOG_LEVEL"))
+	return
 }
 
 func (r *Raft) Warn(format string, args ...interface{}) {
