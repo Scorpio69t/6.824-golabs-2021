@@ -25,30 +25,31 @@ func TestAppendEntriesConflictAfterPrevLog(t *testing.T) {
 			state:       Follower,
 		},
 		applyCh: applyCh,
-		logEntries: []*LogEntry{
-			{
-				Index:   0,
-				Term:    0,
-				Command: nil,
-			},
-			{
-				Index:   1,
-				Term:    2,
-				Command: 101,
-			},
-			{
-				Index:   2,
-				Term:    4,
-				Command: 102,
-			},
-			{
-				Index:   3,
-				Term:    4,
-				Command: 103,
-			},
-		},
 	}
 	r.logger = newRaftLogger(r)
+	r.logEntriesManager = NewLogEntriesManager(r)
+	r.logEntriesManager.logs = []*LogEntry{
+		{
+			Index:   0,
+			Term:    0,
+			Command: nil,
+		},
+		{
+			Index:   1,
+			Term:    2,
+			Command: 101,
+		},
+		{
+			Index:   2,
+			Term:    4,
+			Command: 102,
+		},
+		{
+			Index:   3,
+			Term:    4,
+			Command: 103,
+		},
+	}
 	args := &AppendEntriesArgs{
 		Term:         7,
 		LeaderId:     1,
@@ -68,7 +69,6 @@ func TestAppendEntriesConflictAfterPrevLog(t *testing.T) {
 		},
 		LeaderCommit: 4,
 	}
-	r.updateLastLog()
 
 	rpc := &RPC{
 		Args:   args,
@@ -131,30 +131,32 @@ func TestAppendEntriesConflictAtPrevLog(t *testing.T) {
 			state:       Follower,
 		},
 		applyCh: applyCh,
-		logEntries: []*LogEntry{
-			{
-				Index:   0,
-				Term:    0,
-				Command: nil,
-			},
-			{
-				Index:   1,
-				Term:    2,
-				Command: 101,
-			},
-			{
-				Index:   2,
-				Term:    4,
-				Command: 102,
-			},
-			{
-				Index:   3,
-				Term:    4,
-				Command: 103,
-			},
-		},
 	}
 	r.logger = newRaftLogger(r)
+	r.logEntriesManager = NewLogEntriesManager(r)
+	r.logEntriesManager.logs = []*LogEntry{
+		{
+			Index:   0,
+			Term:    0,
+			Command: nil,
+		},
+		{
+			Index:   1,
+			Term:    2,
+			Command: 101,
+		},
+		{
+			Index:   2,
+			Term:    4,
+			Command: 102,
+		},
+		{
+			Index:   3,
+			Term:    4,
+			Command: 103,
+		},
+	}
+
 	args := &AppendEntriesArgs{
 		Term:         7,
 		LeaderId:     1,
@@ -174,7 +176,6 @@ func TestAppendEntriesConflictAtPrevLog(t *testing.T) {
 		},
 		LeaderCommit: 4,
 	}
-	r.updateLastLog()
 
 	rpc := &RPC{
 		Args:   args,
@@ -232,25 +233,26 @@ func TestAppendEntriesNoConflict(t *testing.T) {
 			state:       Follower,
 		},
 		applyCh: applyCh,
-		logEntries: []*LogEntry{
-			{
-				Index:   0,
-				Term:    0,
-				Command: nil,
-			},
-			{
-				Index:   1,
-				Term:    2,
-				Command: 101,
-			},
-			{
-				Index:   2,
-				Term:    4,
-				Command: 102,
-			},
-		},
 	}
 	r.logger = newRaftLogger(r)
+	r.logEntriesManager = NewLogEntriesManager(r)
+	r.logEntriesManager.logs = []*LogEntry{
+		{
+			Index:   0,
+			Term:    0,
+			Command: nil,
+		},
+		{
+			Index:   1,
+			Term:    2,
+			Command: 101,
+		},
+		{
+			Index:   2,
+			Term:    4,
+			Command: 102,
+		},
+	}
 	args := &AppendEntriesArgs{
 		Term:         6,
 		LeaderId:     1,
@@ -270,7 +272,6 @@ func TestAppendEntriesNoConflict(t *testing.T) {
 		},
 		LeaderCommit: 4,
 	}
-	r.updateLastLog()
 
 	rpc := &RPC{
 		Args:   args,

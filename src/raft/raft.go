@@ -67,9 +67,9 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	leaderId int
 	raftState
-	lastContact      time.Time
-	lastContactMutex sync.RWMutex
-	logEntries       []*LogEntry
+	lastContact       time.Time
+	lastContactMutex  sync.RWMutex
+	logEntriesManager *logEntriesManager
 
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -80,13 +80,6 @@ type Raft struct {
 	applyCh       chan ApplyMsg
 	startCh       chan *StartCall
 	applyNotifyCh chan bool
-}
-
-// pushLogToLocal append a new entry to local logEntries.
-// The function is not thread-safe, and it is necessary to accquire lastLock before being called.
-func (r *Raft) pushLogToLocal(log *LogEntry) {
-	r.logger.Info("pushToLocal: oldIndex=%d, oldTerm=%d, newIndex=%d, newTerm=%d\n", r.lastLogIndex, r.lastLogTerm, log.Index, log.Term)
-	r.logEntries = append(r.logEntries, log)
 }
 
 func (r *Raft) LastContact() time.Time {
@@ -171,7 +164,7 @@ func (r *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term         int
+	Term         uint64
 	CandidateId  int
 	LastLogIndex uint64
 	LastLogTerm  uint64
@@ -182,7 +175,7 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	Term        int
+	Term        uint64
 	VoteGranted bool
 }
 
@@ -198,13 +191,9 @@ func (r *Raft) handleRPC(args interface{}, rpcId string) (response RPCResponse) 
 	defer close(rpc.respCh)
 
 	// We use the concurrent model based on channel, and
-	// the actual handler will excute in r.run().
-	r.logger.Trace("handleRPC(%s): before sending to r.rpcCh", rpc.id)
+	// the actual handler will execute in r.run().
 	r.rpcCh <- rpc
-	r.logger.Trace("handleRPC(%s): after sending to r.rpcCh", rpc.id)
-
-	resp := <-rpc.respCh
-	return resp
+	return <-rpc.respCh
 }
 
 func (r *Raft) processRPC(rpc *RPC) {
@@ -252,19 +241,19 @@ func (r *Raft) requestVote(rpc *RPC, args *RequestVoteArgs) {
 	}
 
 	// Ignore older term.
-	if args.Term < int(r.raftState.getCurrentTerm()) {
+	if args.Term < r.raftState.getCurrentTerm() {
 		return
 	}
 
 	// Discover newer term, convert to follower and update term.
-	if args.Term > int(r.raftState.getCurrentTerm()) {
+	if args.Term > r.raftState.getCurrentTerm() {
 		r.logger.Info("RPC requestVote: discover newer term.")
 		r.setState(Follower)
-		r.setCurrentTerm(uint64(args.Term))
+		r.setCurrentTerm(args.Term)
 	}
 
 	// Have voted in this term.
-	if r.raftState.LastVoteTerm() == uint64(args.Term) && r.raftState.LastVoteFor() != -1 {
+	if r.raftState.LastVoteTerm() == args.Term && r.raftState.LastVoteFor() != -1 {
 		r.logger.Warn("RPC requestVote: duplicated RequestVote term, term=%d\n", args.Term)
 		if r.raftState.LastVoteFor() == int32(args.CandidateId) {
 			resp.VoteGranted = true
@@ -293,7 +282,7 @@ func (r *Raft) requestVote(rpc *RPC, args *RequestVoteArgs) {
 }
 
 type AppendEntriesArgs struct {
-	Term         int
+	Term         uint64
 	LeaderId     int
 	PrevLogIndex uint64
 	PrevLogTerm  uint64
@@ -302,7 +291,7 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
+	Term    uint64
 	Success bool
 }
 
@@ -318,22 +307,6 @@ func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 	reply.Term = response.Response.(*AppendEntriesReply).Term
 }
 
-// updateLastLog updates r.lastLogIndex and r.lastLogTerm
-// The function is not thread-safe.
-func (r *Raft) updateLastLog() {
-	newLastLog := r.logEntries[len(r.logEntries)-1]
-	r.lastLogIndex = newLastLog.Index
-	r.lastLogTerm = newLastLog.Term
-	r.logger.Debug("updateLastLog: index=%d, term=%d\n", newLastLog.Index, newLastLog.Term)
-}
-
-// deleteLogAfter delete conflict logs after index for the followers.
-// The function is not thread-safe.
-func (r *Raft) deleteLogAfter(index uint64) {
-	r.logger.Warn("delete: conflictIndex=%d\n", index)
-	r.logEntries = r.logEntries[:index]
-}
-
 // appendEntries implements the AppendEntries RPC in the paper.
 func (r *Raft) appendEntries(rpc *RPC, args *AppendEntriesArgs) {
 	// r.Trace("appendEntries: called\n")
@@ -343,7 +316,7 @@ func (r *Raft) appendEntries(rpc *RPC, args *AppendEntriesArgs) {
 
 	// Defer return rpc.
 	resp := &AppendEntriesReply{
-		Term:    int(r.raftState.getCurrentTerm()),
+		Term:    r.raftState.getCurrentTerm(),
 		Success: false,
 	}
 	var err error
@@ -352,17 +325,17 @@ func (r *Raft) appendEntries(rpc *RPC, args *AppendEntriesArgs) {
 	}()
 
 	// Discover older leader, return directly.
-	if r.raftState.getCurrentTerm() > uint64(args.Term) {
+	if r.raftState.getCurrentTerm() > args.Term {
 		r.logger.Warn("RPC: appendEntries: receive older term\n")
 		// Reply false.
 		return
 	}
 
 	// Discover newer leader, convert to follower.
-	if r.me != args.LeaderId && (r.raftState.getCurrentTerm() < uint64(args.Term) || r.raftState.getState() != Follower) {
+	if r.me != args.LeaderId && (r.raftState.getCurrentTerm() < args.Term || r.raftState.getState() != Follower) {
 		r.logger.Info("RPC: appendEntries: find new leader: leader=%d, term=%d\n", args.LeaderId, args.Term)
 		r.setState(Follower)
-		r.setCurrentTerm(uint64(args.Term))
+		r.setCurrentTerm(args.Term)
 		resp.Term = args.Term
 	}
 
@@ -371,59 +344,68 @@ func (r *Raft) appendEntries(rpc *RPC, args *AppendEntriesArgs) {
 	r.SetLastContact()
 	r.leaderId = args.LeaderId
 
-	// Operations below will read/write lastIndex, and logEntries, we need to accquire the lastLock.
-	// r.Trace("appendEntries: before r.lastLock.Lock()\n")
-	r.lastLock.Lock()
-	defer r.lastLock.Unlock()
-	// r.Trace("appendEntries: after r.lastLock.Lock()\n")
-
-	// The lastIndex or lastTerm may not up-to-date so
-	// we need to update then first.
-	r.updateLastLog()
-
+	// Operations below will read/write lastIndex, and logEntries, we need to acquire the lastLock.
 	// Do not contain an entry at prevLogIndex whose term matches prevLogTerm.
-	if r.lastLogIndex < args.PrevLogIndex {
-		r.logger.Info("RPC: appendEntries: do not contain an entry at prevLogIndex: prevLogIndex=%d\n", args.PrevLogIndex)
-		// Reply false.
+	prevLog, err := r.logEntriesManager.Get(uint64(int(args.PrevLogIndex)))
+	if err != nil {
+		if err == ErrorOutOfRange {
+			r.logger.Info("appendEntries: " + err.Error())
+		} else {
+			r.logger.Error("appendEntries: " + err.Error())
+		}
 		return
 	}
-	if r.logEntries[args.PrevLogIndex].Term != args.PrevLogTerm {
-		// Delete conflict entries.
-		r.logger.Info("RPC: appendEntries: prevLogIndex conflict\n")
-		r.deleteLogAfter(args.PrevLogIndex)
-		r.updateLastLog()
+
+	// Check for consistency.
+	if prevLog.Term != args.PrevLogTerm {
+		// DeleteBetween conflict entries.
 		// Reply false.
+		r.logger.Info("RPC: appendEntries: prevLogIndex conflict\n")
+		if err := r.logEntriesManager.DeleteAfter(args.PrevLogIndex); err != nil {
+			r.logger.Error("appendEntries: " + err.Error())
+			return
+		}
 		return
 	}
 
 	// The entry at prevLogIndex has the same term as prevLogTerm, so we will reply true below.
 	// Append any new entries not already in the log.
-	newEntries := []*LogEntry{}
-	for i, newEntry := range args.Entries {
-		if r.lastLogIndex >= newEntry.Index {
-			if r.logEntries[r.lastLogIndex].Term != newEntry.Term {
-				// Find conflict logs at index=newEntry.Index.
-				r.logger.Debug("RPC: appendEntries: conflict entries after prevLogIndex: conflictIndex=%d\n", newEntry.Index)
-				// Delete r.logEntries[newEntry.Index:].
-				r.deleteLogAfter(newEntry.Index)
-				r.updateLastLog()
-				// We should append entries whose index is equal or greater than newEntry.Index(conflict one).
+	var newEntries []*LogEntry
+	for i, argsLogEntries := range args.Entries {
+		// Find local log entries whose index == argsLogEntries.Index
+		localLog, err := r.logEntriesManager.Get(argsLogEntries.Index)
+		if err != nil {
+			if err == ErrorOutOfRange {
+				// No conflict entries found. Append new entries.
+				r.logger.Info("appendEntries: " + err.Error())
 				newEntries = args.Entries[i:]
 				break
 			} else {
-				// Skip duplicated logs.
-				continue
+				r.logger.Error("appendEntries: " + err.Error())
+				return
 			}
-		} else {
-			// No conflict entries found. Append new entries.
+		}
+
+		// Check for consistency.
+		if localLog.Term != argsLogEntries.Term {
+			// Find conflict logs at index = argsLogEntries.Index.
+			r.logger.Debug("RPC: appendEntries: conflict entries after prevLogIndex: conflictIndex=%d\n", argsLogEntries.Index)
+			// Delete logs after argsLogEntries.Index.
+			if err := r.logEntriesManager.DeleteAfter(argsLogEntries.Index); err != nil {
+				r.logger.Error("appendEntries: " + err.Error())
+			}
+			// We should append entries whose index is equal or greater than argsLogEntries.Index(conflict one).
 			newEntries = args.Entries[i:]
 			break
 		}
 	}
+
+	// Push to local.
 	for _, newEntry := range newEntries {
-		r.pushLogToLocal(newEntry)
+		if err := r.logEntriesManager.PushLocal(newEntry); err != nil {
+			r.logger.Error(err.Error())
+		}
 	}
-	r.updateLastLog()
 
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	if r.getCommitIndex() < args.LeaderCommit {
@@ -616,18 +598,16 @@ func (r *Raft) setupCandidate() (voteCh chan *RequestVoteReply) {
 
 	// Vote for self.
 	voteCh <- &RequestVoteReply{
-		Term:        int(r.raftState.currentTerm),
+		Term:        r.raftState.currentTerm,
 		VoteGranted: true,
 	}
 	r.raftState.SetLastVoteFor(int32(r.me))
 	r.raftState.SetLastVoteTerm(r.raftState.currentTerm)
 
 	// Send RequestVote RPC
-	r.lastLock.Lock()
-	lastLog := r.logEntries[len(r.logEntries)-1]
-	r.lastLock.Unlock()
+	lastLog, _ := r.logEntriesManager.Get(r.raftState.getLastIndex())
 	args := &RequestVoteArgs{
-		Term:         int(r.raftState.getCurrentTerm()),
+		Term:         r.raftState.getCurrentTerm(),
 		CandidateId:  r.me,
 		LastLogIndex: lastLog.Index,
 		LastLogTerm:  lastLog.Term,
@@ -676,7 +656,7 @@ func (r *Raft) runCandidate() {
 			return
 		case reply := <-voteCh:
 			// Find higher term, become the follower state.
-			if reply.Term > int(r.raftState.currentTerm) {
+			if reply.Term > r.raftState.currentTerm {
 				r.setCurrentTerm(uint64(reply.Term))
 				r.setState(Follower)
 				return
@@ -720,7 +700,7 @@ func (r *Raft) newAppendEntriesArgs(server int, isHeartbeat bool) (args *AppendE
 	// Send heartbeat
 	if isHeartbeat {
 		args = &AppendEntriesArgs{
-			Term:     int(r.raftState.getCurrentTerm()),
+			Term:     r.raftState.getCurrentTerm(),
 			LeaderId: r.me,
 			Entries:  nil,
 		}
@@ -733,25 +713,14 @@ func (r *Raft) newAppendEntriesArgs(server int, isHeartbeat bool) (args *AppendE
 		return
 	}
 
-	r.lastLock.Lock()
-	defer r.lastLock.Unlock()
-	r.indexLock.RLock()
-	defer r.indexLock.RUnlock()
-
 	// Valid AppendEntries RPC.
 	// Deep copy newEntries.
 	serverNextIndex := r.nextIndex[server]
-	end := min(uint64(len(r.logEntries)), serverNextIndex+maxLenNewEntries)
-	length := end - r.nextIndex[server]
-	nextEntries := make([]*LogEntry, length)
-	sourceEntries := r.logEntries[serverNextIndex:end]
-	for i := range nextEntries {
-		nextEntries[i] = new(LogEntry)
-		*nextEntries[i] = *sourceEntries[i]
-	}
-	prevLog := r.logEntries[serverNextIndex-1]
+	end := min(r.getLastIndex(), serverNextIndex+maxLenNewEntries)
+	nextEntries, _ := r.logEntriesManager.GetCopiesBetween(serverNextIndex, end)
+	prevLog, _ := r.logEntriesManager.Get(serverNextIndex - 1)
 	args = &AppendEntriesArgs{
-		Term:         int(r.getCurrentTerm()),
+		Term:         r.getCurrentTerm(),
 		LeaderId:     r.me,
 		LeaderCommit: r.commitIndex,
 		PrevLogIndex: prevLog.Index,
@@ -826,7 +795,7 @@ func (r *Raft) sendHeartbeatToAll(lc *leaderChannels) {
 			reply := &AppendEntriesReply{}
 			ok := r.sendAppendEntries(server, args, reply)
 
-			if ok && r.getState() == Leader && reply.Term > int(r.getCurrentTerm()) {
+			if ok && r.getState() == Leader && reply.Term > r.getCurrentTerm() {
 				select {
 				case <-lc.ctx.Done():
 					return
@@ -892,13 +861,19 @@ func (r *Raft) updateLeaderCommit() {
 	right := r.getLastIndex()
 	for left <= right {
 		mid := left + (right-left)/2
+		midLog, err := r.logEntriesManager.Get(mid)
+		if err != nil {
+			r.logger.Error("updateLeaderCommit: " + err.Error())
+			r.indexLock.RUnlock()
+			return
+		}
 		// Check term.
-		if r.logEntries[mid].Term > r.getCurrentTerm() {
-			r.logger.Error("Goroutine::UpdateCommitIndex(): newer term is found.")
+		if midLog.Term > r.getCurrentTerm() {
+			r.logger.Error("updateLeaderCommit: newer term is found.")
 			r.indexLock.Unlock()
 			return
 		}
-		if r.logEntries[mid].Term < r.getCurrentTerm() {
+		if midLog.Term < r.getCurrentTerm() {
 			left = mid + 1
 			continue
 		}
@@ -949,10 +924,10 @@ func (r *Raft) runLeader() {
 			}
 			reply := wrapper.reply
 			// Discover newer term, convert to follower.
-			if reply.Term > int(r.getCurrentTerm()) {
+			if reply.Term > r.getCurrentTerm() {
 				r.logger.Info("find higher term, leader(%d) -> follower(%d)\n", r.raftState.getCurrentTerm(), reply.Term)
 				r.setState(Follower)
-				r.setCurrentTerm(uint64(reply.Term))
+				r.setCurrentTerm(reply.Term)
 				return
 			}
 
@@ -970,6 +945,7 @@ func (r *Raft) runLeader() {
 		case <-lc.heartbeatTimerCh:
 			// r.sendHeartbeatToAll(lc)
 		case <-lc.appendEntriesTimerCh:
+			r.logger.Debug("runLeader: receive appendEntriesTimerCh")
 			r.sendAppendEntriesToAll(lc)
 		case <-lc.updateCommitIndexTimerCh:
 			r.updateLeaderCommit()
@@ -983,7 +959,9 @@ func (r *Raft) runLeader() {
 				Term:    r.getCurrentTerm(),
 				Command: sc.command,
 			}
-			r.pushLogToLocal(newLog)
+			if err := r.logEntriesManager.PushLocal(newLog); err != nil {
+				r.logger.Error("runLeader: " + err.Error())
+			}
 			r.setLastLog(newLog.Index, newLog.Term)
 			r.matchIndex[r.me] = newLog.Index
 			sc.respCh <- &StartResult{
@@ -1018,19 +996,21 @@ func (r *Raft) applyGoroutine() {
 
 		// Apply logs whose index is between start and newCommitIndex.
 		r.logger.Debug("apply: [%d, %d]\n", start, newCommitIndex)
-		applyMsgs := make([]ApplyMsg, newCommitIndex-start+1)
-		for i := range applyMsgs {
-			le := r.logEntries[i+int(start)]
-			applyMsgs[i] = ApplyMsg{
+		logsToApply, err := r.logEntriesManager.GetCopiesBetween(start, newCommitIndex)
+		if err != nil {
+			panic("applyGoroutine: " + err.Error())
+		}
+		for _, log := range logsToApply {
+			applyMsg := ApplyMsg{
 				CommandValid:  true,
-				Command:       le.Command,
-				CommandIndex:  int(le.Index),
+				Command:       log.Command,
+				CommandIndex:  int(log.Index),
 				SnapshotValid: false,
-				Snapshot:      []byte{},
+				Snapshot:      nil,
 				SnapshotTerm:  0,
-				SnapshotIndex: i,
+				SnapshotIndex: 0,
 			}
-			r.applyCh <- applyMsgs[i]
+			r.applyCh <- applyMsg
 		}
 		r.setLastApplied(newCommitIndex)
 	}
@@ -1081,16 +1061,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		nextIndex:         make([]uint64, len(peers)),
 		matchIndex:        make([]uint64, len(peers)),
 	}
-	// We need a dummy entry for convenience.
-	r.logEntries = []*LogEntry{{
-		Index: 0,
-		Term:  0,
-	}}
-	r.leaderId = -1
-
-	// Logger
+	// Logger.
 	r.logger = newRaftLogger(r)
 
+	// Log manager.
+	r.logEntriesManager = NewLogEntriesManager(r)
+	r.leaderId = -1
+
+	// Reset lastContact.
 	r.SetLastContact()
 
 	// Channels

@@ -49,6 +49,7 @@ const (
 func newRaftLogger(r *Raft) (rl *raftLogger) {
 	rl = new(raftLogger)
 	rl.Logger = *log.Default()
+	rl.Logger.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	rl.raft = r
 	rl.logLevel = mapStringToLogLevel(os.Getenv(EnvKeyLogLevel))
 	return
