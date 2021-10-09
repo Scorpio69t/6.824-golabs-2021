@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"log"
 	"testing"
 )
 
@@ -20,8 +19,6 @@ func TestAppendEntriesConflictAfterPrevLog(t *testing.T) {
 		me:        0,
 		leaderId:  1,
 		persister: &Persister{},
-		logger:    *log.Default(),
-		logLevel:  LevelTrace,
 		raftState: raftState{
 			currentTerm: 7,
 			commitIndex: 2,
@@ -51,6 +48,7 @@ func TestAppendEntriesConflictAfterPrevLog(t *testing.T) {
 			},
 		},
 	}
+	r.logger = newRaftLogger(r)
 	args := &AppendEntriesArgs{
 		Term:         7,
 		LeaderId:     1,
@@ -127,8 +125,6 @@ func TestAppendEntriesConflictAtPrevLog(t *testing.T) {
 		me:        0,
 		leaderId:  1,
 		persister: &Persister{},
-		logger:    *log.Default(),
-		logLevel:  LevelTrace,
 		raftState: raftState{
 			currentTerm: 7,
 			commitIndex: 1,
@@ -158,6 +154,7 @@ func TestAppendEntriesConflictAtPrevLog(t *testing.T) {
 			},
 		},
 	}
+	r.logger = newRaftLogger(r)
 	args := &AppendEntriesArgs{
 		Term:         7,
 		LeaderId:     1,
@@ -229,8 +226,6 @@ func TestAppendEntriesNoConflict(t *testing.T) {
 		me:        0,
 		leaderId:  1,
 		persister: &Persister{},
-		logger:    *log.Default(),
-		logLevel:  LevelTrace,
 		raftState: raftState{
 			currentTerm: 6,
 			commitIndex: 1,
@@ -255,6 +250,7 @@ func TestAppendEntriesNoConflict(t *testing.T) {
 			},
 		},
 	}
+	r.logger = newRaftLogger(r)
 	args := &AppendEntriesArgs{
 		Term:         6,
 		LeaderId:     1,
