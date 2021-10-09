@@ -353,7 +353,7 @@ func TestRaft_persist(t *testing.T) {
 
 	r.initializeDefault()
 	r.readPersist(r.persister.ReadRaftState())
-	if r.getCurrentTerm() != currentTerm || r.LastVoteFor() != lastVoteFor || r.LastVoteTerm() != lastVoteTerm {
+	if r.getCurrentTerm() != currentTerm || r.getLastIndex() != lastIndex || r.LastVoteFor() != lastVoteFor || r.LastVoteTerm() != lastVoteTerm {
 		t.Fatalf("wrong persistence state")
 	}
 	if len(r.logEntriesManager.logs) != len(logs) {
@@ -374,7 +374,7 @@ func TestRaft_persist_without_state(t *testing.T) {
 	// We had not persisted the raft state before,
 	// so the state will be expected not to change.
 	r.readPersist(r.persister.ReadRaftState())
-	if r.getCurrentTerm() != 1 || r.LastVoteFor() != -1 || r.LastVoteTerm() != 0 {
+	if r.getCurrentTerm() != 1 || r.getLastIndex() != 0 || r.LastVoteFor() != -1 || r.LastVoteTerm() != 0 {
 		t.Fatalf("wrong persistence state")
 	}
 	if len(r.logEntriesManager.logs) != 1 {

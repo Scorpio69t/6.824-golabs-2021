@@ -115,7 +115,7 @@ func (r *Raft) persist() {
 	if e.Encode(r.raftState.getCurrentTerm()) != nil ||
 		e.Encode(r.LastVoteFor()) != nil ||
 		e.Encode(r.LastVoteTerm()) != nil ||
-		r.logEntriesManager.Persist(e) != nil {
+		r.logEntriesManager.Encode(e) != nil {
 		r.logger.Error("persist: encode failed")
 	}
 	data := w.Bytes()
@@ -142,10 +142,16 @@ func (r *Raft) readPersist(data []byte) {
 		r.logger.Error("readPersist: decode failed")
 		return
 	}
+	r.logger.Info("readPersist: currentTerm=%d, lastVoteFor=%d, lastVoteTerm=%d, logLength=%d", currentTerm, lastVoteFor, lastVoteTerm, len(logs))
 	r.setCurrentTerm(currentTerm)
 	r.SetLastVoteFor(lastVoteFor)
 	r.SetLastVoteTerm(lastVoteTerm)
 	r.logEntriesManager.SetLogs(logs)
+	lastLog, err := r.logEntriesManager.GetLastLog()
+	if err != nil {
+		panic(err)
+	}
+	r.setLastLog(lastLog.Index, lastLog.Term)
 }
 
 // CondInstallSnapshot
@@ -260,6 +266,7 @@ func (r *Raft) requestVote(rpc *RPC, args *RequestVoteArgs) {
 		r.logger.Info("RPC requestVote: discover newer term.")
 		r.setState(Follower)
 		r.setCurrentTerm(args.Term)
+		r.persist()
 	}
 
 	// Have voted in this term.
@@ -288,6 +295,7 @@ func (r *Raft) requestVote(rpc *RPC, args *RequestVoteArgs) {
 	resp.Term = args.Term
 	r.raftState.SetLastVoteTerm(r.raftState.getCurrentTerm())
 	r.raftState.SetLastVoteFor(int32(args.CandidateId))
+	r.persist()
 	r.SetLastContact()
 }
 
@@ -346,6 +354,7 @@ func (r *Raft) appendEntries(rpc *RPC, args *AppendEntriesArgs) {
 		r.logger.Info("RPC: appendEntries: find new leader: leader=%d, term=%d\n", args.LeaderId, args.Term)
 		r.setState(Follower)
 		r.setCurrentTerm(args.Term)
+		r.persist()
 		resp.Term = args.Term
 	}
 
@@ -589,6 +598,7 @@ func (r *Raft) runFollower() {
 			// Switch to the candidate state.
 			r.leaderId = -1
 			r.setCurrentTerm(r.raftState.getCurrentTerm() + 1)
+			r.persist()
 			r.setState(Candidate)
 			return
 		case sc := <-r.startCh:
@@ -608,11 +618,12 @@ func (r *Raft) setupCandidate() (voteCh chan *RequestVoteReply) {
 
 	// Vote for self.
 	voteCh <- &RequestVoteReply{
-		Term:        r.raftState.currentTerm,
+		Term:        r.raftState.getCurrentTerm(),
 		VoteGranted: true,
 	}
 	r.raftState.SetLastVoteFor(int32(r.me))
-	r.raftState.SetLastVoteTerm(r.raftState.currentTerm)
+	r.raftState.SetLastVoteTerm(r.raftState.getCurrentTerm())
+	r.persist()
 
 	// Send RequestVote RPC
 	lastLog, _ := r.logEntriesManager.Get(r.raftState.getLastIndex())
@@ -640,7 +651,7 @@ func (r *Raft) setupCandidate() (voteCh chan *RequestVoteReply) {
 }
 
 func (r *Raft) runCandidate() {
-	r.logger.Debug("runCandidate: start election: term=%d\n", r.raftState.getCurrentTerm())
+	r.logger.Info("runCandidate: start election: term=%d\n", r.raftState.getCurrentTerm())
 	electionTimeout := randomTimeout(time.Millisecond * candidateElectionMs)
 
 	voteCh := r.setupCandidate()
@@ -663,11 +674,13 @@ func (r *Raft) runCandidate() {
 			// Increase term and start a new round of election.
 			r.logger.Warn("election: timeout\n")
 			r.setCurrentTerm(r.raftState.getCurrentTerm() + 1)
+			r.persist()
 			return
 		case reply := <-voteCh:
 			// Find higher term, become the follower state.
 			if reply.Term > r.raftState.currentTerm {
-				r.setCurrentTerm(uint64(reply.Term))
+				r.setCurrentTerm(reply.Term)
+				r.persist()
 				r.setState(Follower)
 				return
 			}
@@ -938,6 +951,7 @@ func (r *Raft) runLeader() {
 				r.logger.Info("find higher term, leader(%d) -> follower(%d)\n", r.raftState.getCurrentTerm(), reply.Term)
 				r.setState(Follower)
 				r.setCurrentTerm(reply.Term)
+				r.persist()
 				return
 			}
 
@@ -1005,7 +1019,7 @@ func (r *Raft) applyGoroutine() {
 		start := r.getLastApplied() + 1
 
 		// Apply logs whose index is between start and newCommitIndex.
-		r.logger.Debug("apply: [%d, %d]\n", start, newCommitIndex)
+		r.logger.Info("apply: [%d, %d]\n", start, newCommitIndex)
 		logsToApply, err := r.logEntriesManager.GetCopiesBetween(start, newCommitIndex)
 		if err != nil {
 			panic("applyGoroutine: " + err.Error())
