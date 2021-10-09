@@ -1,12 +1,17 @@
 package raft
 
-import "errors"
+import (
+	"6.824/labgob"
+	"errors"
+)
 
 // logEntriesManager is used to store and retrieve raft's logs.
 type logEntriesManager struct {
 	logger    *raftLogger
 	raftState *raftState
-	logs      []*LogEntry
+
+	// Persistent
+	logs []*LogEntry
 }
 
 // NewLogEntriesManager makes a new logEntriesManager.
@@ -67,4 +72,14 @@ func (lem *logEntriesManager) GetCopiesBetween(begin uint64, end uint64) (logs [
 		}
 	}
 	return
+}
+
+// Persist persists the logs.
+func (lem *logEntriesManager) Persist(encoder *labgob.LabEncoder) (err error) {
+	err = encoder.Encode(lem.logs)
+	return
+}
+
+func (lem *logEntriesManager) SetLogs(logs []*LogEntry) {
+	lem.logs = logs
 }

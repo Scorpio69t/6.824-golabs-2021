@@ -20,6 +20,8 @@ package raft
 import (
 	//	"bytes"
 
+	"6.824/labgob"
+	"bytes"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -105,16 +107,19 @@ func (r *Raft) GetState() (int, bool) {
 // persist saves Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
-//
+// We need to persist currentTerm, lastVoteFor, lastVoteTerm, and logs.
 func (r *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if e.Encode(r.raftState.getCurrentTerm()) != nil ||
+		e.Encode(r.LastVoteFor()) != nil ||
+		e.Encode(r.LastVoteTerm()) != nil ||
+		r.logEntriesManager.Persist(e) != nil {
+		r.logger.Error("persist: encode failed")
+	}
+	data := w.Bytes()
+	r.persister.SaveRaftState(data)
 }
 
 // readPersist restores previously persisted state.
@@ -124,18 +129,23 @@ func (r *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	buf := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(buf)
+	var currentTerm uint64
+	var lastVoteFor int32
+	var lastVoteTerm uint64
+	var logs []*LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&lastVoteFor) != nil ||
+		d.Decode(&lastVoteTerm) != nil ||
+		d.Decode(&logs) != nil {
+		r.logger.Error("readPersist: decode failed")
+		return
+	}
+	r.setCurrentTerm(currentTerm)
+	r.SetLastVoteFor(lastVoteFor)
+	r.SetLastVoteTerm(lastVoteTerm)
+	r.logEntriesManager.SetLogs(logs)
 }
 
 // CondInstallSnapshot
@@ -1044,8 +1054,26 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	r.peers = peers
 	r.persister = persister
 	r.me = me
+	r.applyCh = applyCh
 
 	// Your initialization code here (2A, 2B, 2C).
+	r.initializeDefault()
+
+	// initializeDefault from state persisted before a crash
+	r.readPersist(persister.ReadRaftState())
+
+	// start ticker goroutine to start elections
+	// I don't want to implement it this way!
+	// go rf.ticker()
+	go r.run()
+	go r.applyGoroutine()
+	go r.debugPrintGoroutine(time.Millisecond * 1000)
+
+	return r
+}
+
+// initializeDefault sets default state.
+func (r *Raft) initializeDefault() {
 	// States
 	r.raftState = raftState{
 		currentTerm:       1,
@@ -1058,14 +1086,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		state:             Follower,
 		lastVoteFor:       -1,
 		lastVoteTerm:      0,
-		nextIndex:         make([]uint64, len(peers)),
-		matchIndex:        make([]uint64, len(peers)),
+		nextIndex:         make([]uint64, len(r.peers)),
+		matchIndex:        make([]uint64, len(r.peers)),
 	}
 	// Logger.
 	r.logger = newRaftLogger(r)
 
 	// Log manager.
 	r.logEntriesManager = NewLogEntriesManager(r)
+
+	// Leader id.
 	r.leaderId = -1
 
 	// Reset lastContact.
@@ -1074,19 +1104,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Channels
 	r.rpcCh = make(chan *RPC)
 	r.killCh = make(chan struct{})
-	r.applyCh = applyCh
 	r.startCh = make(chan *StartCall)
 	r.applyNotifyCh = make(chan bool)
-
-	// initialize from state persisted before a crash
-	r.readPersist(persister.ReadRaftState())
-
-	// start ticker goroutine to start elections
-	// I don't want to implement it this way!
-	// go rf.ticker()
-	go r.run()
-	go r.applyGoroutine()
-	go r.debugPrintGoroutine(time.Millisecond * 1000)
-
-	return r
 }

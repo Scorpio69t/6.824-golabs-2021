@@ -312,3 +312,72 @@ func TestAppendEntriesNoConflict(t *testing.T) {
 		}
 	}
 }
+
+func TestRaft_persist(t *testing.T) {
+	r := new(Raft)
+	lastIndex := uint64(3)
+	lastTerm := uint64(3)
+	currentTerm := uint64(3)
+	lastVoteFor := int32(2)
+	lastVoteTerm := uint64(2)
+	logs := []*LogEntry{
+		{
+			Index:   0,
+			Term:    0,
+			Command: nil,
+		},
+		{
+			Index:   1,
+			Term:    1,
+			Command: 100,
+		},
+		{
+			Index:   2,
+			Term:    2,
+			Command: 101,
+		},
+		{
+			Index:   3,
+			Term:    3,
+			Command: 102,
+		},
+	}
+	r.persister = MakePersister()
+	r.initializeDefault()
+	r.setCurrentTerm(currentTerm)
+	r.setLastLog(lastIndex, lastTerm)
+	r.SetLastVoteFor(lastVoteFor)
+	r.SetLastVoteTerm(lastVoteTerm)
+	r.logEntriesManager.SetLogs(logs)
+	r.persist()
+
+	r.initializeDefault()
+	r.readPersist(r.persister.ReadRaftState())
+	if r.getCurrentTerm() != currentTerm || r.LastVoteFor() != lastVoteFor || r.LastVoteTerm() != lastVoteTerm {
+		t.Fatalf("wrong persistence state")
+	}
+	if len(r.logEntriesManager.logs) != len(logs) {
+		t.Fatalf("wrong logs length")
+	}
+	for i := range logs {
+		if *logs[i] != *r.logEntriesManager.logs[i] {
+			t.Fatalf("wrong log command")
+		}
+	}
+}
+
+func TestRaft_persist_without_state(t *testing.T) {
+	r := new(Raft)
+	r.persister = MakePersister()
+	r.initializeDefault()
+
+	// We had not persisted the raft state before,
+	// so the state will be expected not to change.
+	r.readPersist(r.persister.ReadRaftState())
+	if r.getCurrentTerm() != 1 || r.LastVoteFor() != -1 || r.LastVoteTerm() != 0 {
+		t.Fatalf("wrong persistence state")
+	}
+	if len(r.logEntriesManager.logs) != 1 {
+		t.Fatalf("wrong logs length")
+	}
+}

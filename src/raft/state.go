@@ -47,7 +47,7 @@ type raftState struct {
 	// the struct so they're 64 bit aligned which is a requirement for
 	// atomic ops on 32 bit platforms.
 
-	// The current term, cache of StableStore
+	// The current term, cache of StableStore (Persistent)
 	currentTerm uint64
 
 	// Highest committed log entry
@@ -73,7 +73,7 @@ type raftState struct {
 	// The current state
 	state RaftState
 
-	// Vote state
+	// Vote state (Persistent)
 	lastVoteTerm uint64
 	lastVoteFor  int32
 
