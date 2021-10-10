@@ -428,8 +428,8 @@ func (r *Raft) appendEntries(rpc *RPC, args *AppendEntriesArgs) {
 
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	if r.getCommitIndex() < args.LeaderCommit {
-		r.logger.Info("RPC: appendEntries(%s): attempt to update commitIndex\n", rpc.id)
 		r.setCommitIndex(min(args.LeaderCommit, r.lastLogIndex))
+		r.logger.Info("RPC: appendEntries(%s): set commitIndex=%d\n", rpc.id, r.getCommitIndex())
 		r.applyNotifyCh <- true
 	}
 	resp.Success = true
@@ -438,7 +438,7 @@ func (r *Raft) appendEntries(rpc *RPC, args *AppendEntriesArgs) {
 func (r *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	// rf.Trace("RPC: sendAppendEntries, server=%d, commitIndex=%d\n", server, args.LeaderCommit)
 	ok := r.peers[server].Call("Raft.AppendEntries", args, reply)
-	if !ok {
+	if !ok && r.getState() == Leader {
 		r.logger.Warn("RPC: sendAppendEntries failed: server=%d, commitIndex=%d\n", server, args.LeaderCommit)
 	}
 	return ok
@@ -476,7 +476,7 @@ func (r *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *App
 func (r *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	r.logger.Debug("RPC: sendRequestVote, server=%d, term=%d\n", server, args.Term)
 	ok := r.peers[server].Call("Raft.RequestVote", args, reply)
-	if !ok {
+	if !ok && r.getState() == Candidate {
 		r.logger.Warn("RPC: sendRequestVote failed: server=%d, term=%d\n", server, args.Term)
 	}
 	return ok
@@ -528,11 +528,13 @@ func (r *Raft) Start(command interface{}) (index int, term int, isLeader bool) {
 // should call killed() to check whether it should stop.
 //
 func (r *Raft) Kill() {
-	atomic.StoreInt32(&r.dead, 1)
 	// Your code here, if desired.
 	r.logger.Error("Kill\n")
 	r.setState(Shutdown)
+	//r.logger.Debug("Kill: before send on killCh")
 	r.killCh <- struct{}{}
+	//r.logger.Debug("Kill: after send on killCh")
+	atomic.StoreInt32(&r.dead, 1)
 }
 
 func (r *Raft) killed() bool {
@@ -542,9 +544,7 @@ func (r *Raft) killed() bool {
 
 // run is the main running goroutine.
 func (r *Raft) run() {
-	defer func() {
-		r.logger.Error("run returned\n")
-	}()
+	r.logger.Info("run")
 	for !r.killed() {
 		r.logger.Debug("run: new round\n")
 		select {
@@ -767,14 +767,6 @@ func (r *Raft) setupLeader(lc *leaderChannels) {
 	}
 	r.leaderId = r.me
 
-	// Send heartbeats periodically.
-	go func() {
-		for r.getState() == Leader {
-			lc.heartbeatTimerCh <- true
-			time.Sleep(leaderAppendEntriesMs * time.Millisecond)
-		}
-	}()
-
 	// Send AppendEntries RPC periodically.
 	go func() {
 		for r.getState() == Leader {
@@ -921,6 +913,7 @@ func (r *Raft) updateLeaderCommit() {
 	if newCommitIndex != 0 {
 		r.indexLock.Lock()
 		r.setCommitIndex(newCommitIndex)
+		r.logger.Info("leader: set commitIndex=%d", r.getCommitIndex())
 		r.applyNotifyCh <- true
 		r.indexLock.Unlock()
 	}
@@ -934,9 +927,7 @@ func (r *Raft) runLeader() {
 	r.setupLeader(lc)
 
 	defer func() {
-		r.logger.Debug("runLeader: before lc.Close()\n")
 		lc.cancel()
-		r.logger.Debug("runLeader: after lc.Close()\n")
 	}()
 
 	for r.raftState.getState() == Leader {
@@ -966,14 +957,13 @@ func (r *Raft) runLeader() {
 				r.nextIndex[fid]--
 			}
 			r.indexLock.Unlock()
-		case <-lc.heartbeatTimerCh:
-			// r.sendHeartbeatToAll(lc)
 		case <-lc.appendEntriesTimerCh:
 			r.logger.Debug("runLeader: receive appendEntriesTimerCh")
 			r.sendAppendEntriesToAll(lc)
 		case <-lc.updateCommitIndexTimerCh:
 			r.updateLeaderCommit()
 		case <-r.killCh:
+			r.logger.Debug("runLeader: receive message from killCh")
 			return
 		case rpc := <-r.rpcCh:
 			r.processRPC(rpc)
@@ -1034,6 +1024,7 @@ func (r *Raft) applyGoroutine() {
 				SnapshotTerm:  0,
 				SnapshotIndex: 0,
 			}
+			r.logger.Info("applyMsg: index=%d, cmd=%v", log.Index, log.Command)
 			r.applyCh <- applyMsg
 		}
 		r.setLastApplied(newCommitIndex)
