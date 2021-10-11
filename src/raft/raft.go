@@ -20,12 +20,14 @@ package raft
 import (
 	//	"bytes"
 
-	"6.824/labgob"
 	"bytes"
+	"encoding/json"
 	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"6.824/labgob"
 
 	//	"6.824/labgob"
 	"6.824/labrpc"
@@ -57,7 +59,7 @@ type ApplyMsg struct {
 
 // Raft is a Go object implementing a single Raft peer.
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	// mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -186,6 +188,11 @@ type RequestVoteArgs struct {
 	LastLogTerm  uint64
 }
 
+func (rva *RequestVoteArgs) String() string {
+	b, _ := json.Marshal(rva)
+	return string(b)
+}
+
 // RequestVoteReply is the RequestVote RPC reply structure.
 // field names must start with capital letters!
 //
@@ -193,6 +200,11 @@ type RequestVoteReply struct {
 	// Your data here (2A).
 	Term        uint64
 	VoteGranted bool
+}
+
+func (rvr *RequestVoteReply) String() string {
+	b, _ := json.Marshal(rvr)
+	return string(b)
 }
 
 func (r *Raft) handleRPC(args interface{}, rpcId string) (response RPCResponse) {
@@ -230,14 +242,13 @@ func (r *Raft) processRPC(rpc *RPC) {
 func (r *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rpcId := uuid.NewString()
-	r.logger.Debug("RPC: RequestVote(%s): called: candidate=%d, term=%d\n", rpcId, args.CandidateId, args.Term)
+	r.logger.Debug("RPC: RequestVote(%s): args: %s", rpcId, args.String())
 	defer func() {
-		r.logger.Debug("RPC: RequestVote(%s): returned: candidate=%d, term=%d, granted=%d\n", rpcId, args.CandidateId, reply.Term, reply.VoteGranted)
+		r.logger.Debug("RPC: RequestVote(%s): return %s", rpcId, reply.String())
 	}()
 
 	response := r.handleRPC(args, rpcId)
-	reply.Term = response.Response.(*RequestVoteReply).Term
-	reply.VoteGranted = response.Response.(*RequestVoteReply).VoteGranted
+	*reply = *response.Response.(*RequestVoteReply)
 }
 
 func (r *Raft) requestVote(rpc *RPC, args *RequestVoteArgs) {
@@ -309,20 +320,30 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    uint64
-	Success bool
+	Term          uint64
+	Success       bool
+	ConflictIndex uint64
+	ConflictTerm  uint64
+}
+
+func (aer *AppendEntriesReply) String() string {
+	b, _ := json.Marshal(aer)
+	return string(b)
+}
+
+func (aea *AppendEntriesArgs) String() string {
+	b, _ := json.Marshal(aea)
+	return string(b)
 }
 
 func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rpcId := uuid.NewString()
-	r.logger.Debug("RPC: AppendEntries(%s): called: leader=%d, term=%d, prevLogIndex=%d, leaderCommit=%d, entries=%s\n",
-		rpcId, args.LeaderId, args.Term, args.PrevLogIndex, args.LeaderCommit, formatLogEntries(args.Entries))
+	r.logger.Debug("RPC: AppendEntries(%s): args: %s", rpcId, args.String())
 	defer func() {
-		r.logger.Debug("RPC: AppendEntries(%s): returned: term=%d, success=%d", rpcId, reply.Term, reply.Success)
+		r.logger.Debug("RPC: AppendEntries(%s): return %s", rpcId, reply.String())
 	}()
 	response := r.handleRPC(args, rpcId)
-	reply.Success = response.Response.(*AppendEntriesReply).Success
-	reply.Term = response.Response.(*AppendEntriesReply).Term
+	*reply = *response.Response.(*AppendEntriesReply)
 }
 
 // appendEntries implements the AppendEntries RPC in the paper.
@@ -365,10 +386,13 @@ func (r *Raft) appendEntries(rpc *RPC, args *AppendEntriesArgs) {
 
 	// Operations below will read/write lastIndex, and logEntries, we need to acquire the lastLock.
 	// Do not contain an entry at prevLogIndex whose term matches prevLogTerm.
-	prevLog, err := r.logEntriesManager.Get(uint64(int(args.PrevLogIndex)))
+	prevLog, err := r.logEntriesManager.Get(args.PrevLogIndex)
 	if err != nil {
-		if err == ErrorOutOfRange {
-			r.logger.Info("appendEntries: " + err.Error())
+		if err == ErrorLogNotExist {
+			// Do not contain prevLog.
+			r.logger.Info("appendEntries: getPrevLog: " + err.Error())
+			resp.ConflictIndex = r.getLastIndex() + 1
+			resp.ConflictTerm = 0
 		} else {
 			r.logger.Error("appendEntries: " + err.Error())
 		}
@@ -377,13 +401,23 @@ func (r *Raft) appendEntries(rpc *RPC, args *AppendEntriesArgs) {
 
 	// Check for consistency.
 	if prevLog.Term != args.PrevLogTerm {
-		// DeleteBetween conflict entries.
-		// Reply false.
 		r.logger.Info("RPC: appendEntries: prevLogIndex conflict\n")
+
+		// Find firstIndex at conflict term, and reply it to optimize.
+		firstIndex, err := r.logEntriesManager.FindFirstIndexByTerm(prevLog.Term)
+		if err != nil {
+			r.logger.Error("appendEntries: findFirstIndex: " + err.Error())
+		}
+		resp.ConflictIndex = firstIndex
+		resp.ConflictTerm = prevLog.Term
+
+		// Delete conflict logs.
 		if err := r.logEntriesManager.DeleteAfter(args.PrevLogIndex); err != nil {
 			r.logger.Error("appendEntries: " + err.Error())
 			return
 		}
+
+		// Reply false.
 		return
 	}
 
@@ -394,7 +428,7 @@ func (r *Raft) appendEntries(rpc *RPC, args *AppendEntriesArgs) {
 		// Find local log entries whose index == argsLogEntries.Index
 		localLog, err := r.logEntriesManager.Get(argsLogEntries.Index)
 		if err != nil {
-			if err == ErrorOutOfRange {
+			if err == ErrorLogNotExist {
 				// No conflict entries found. Append new entries.
 				r.logger.Info("appendEntries: " + err.Error())
 				newEntries = args.Entries[i:]
@@ -591,7 +625,7 @@ func (r *Raft) runFollower() {
 			heartbeatTimer = time.After(time.Millisecond * time.Duration(heartbeatTimeout))
 
 			// Success.
-			if time.Now().Sub(r.LastContact()) < time.Millisecond*time.Duration(oldTimeout) {
+			if time.Since(r.LastContact()) < time.Millisecond*time.Duration(oldTimeout) {
 				continue
 			}
 
@@ -707,9 +741,9 @@ func (r *Raft) runCandidate() {
 }
 
 var (
-	ErrorSendToMe         = errors.New("Send to me.")
-	ErrorInvalidServer    = errors.New("Invalid server id.")
-	ErrorFollowerUpToDate = errors.New("Follower up to date.")
+	ErrorSendToMe         = errors.New("send to me")
+	ErrorInvalidServer    = errors.New("invalid server id")
+	ErrorFollowerUpToDate = errors.New("follower up to date")
 )
 
 // newAppendEntriesArgs build AppendEntries RPC request according to the target server.
@@ -782,47 +816,6 @@ func (r *Raft) setupLeader(lc *leaderChannels) {
 			time.Sleep(300 * time.Millisecond)
 		}
 	}()
-
-	return
-}
-
-// sendAppendEntriesToAll is called by the leader to send Heartbeat RPC to other peers.
-func (r *Raft) sendHeartbeatToAll(lc *leaderChannels) {
-	for peer := range r.peers {
-		// Skip me.
-		if peer == r.me {
-			continue
-		}
-
-		// Build args
-		args, err := r.newAppendEntriesArgs(peer, true)
-		switch err {
-		case ErrorSendToMe:
-			continue
-		case ErrorFollowerUpToDate:
-			// Do nothing.
-		default:
-			r.logger.Warn("Follower %d: "+err.Error(), peer)
-		}
-
-		// Run a goroutine to send RPC
-		go func(server int) {
-			reply := &AppendEntriesReply{}
-			ok := r.sendAppendEntries(server, args, reply)
-
-			if ok && r.getState() == Leader && reply.Term > r.getCurrentTerm() {
-				select {
-				case <-lc.ctx.Done():
-					return
-				default:
-					lc.replyCh <- &appendEntriesReplyWrapper{
-						followerId: server,
-						reply:      reply,
-					}
-				}
-			}
-		}(peer)
-	}
 }
 
 // sendAppendEntriesToAll is called by the leader to send AppendEntries RPC to other peers.
@@ -950,11 +943,14 @@ func (r *Raft) runLeader() {
 			r.indexLock.Lock()
 			if reply.Success {
 				// Update nextIndex and matchIndex.
+				// Set matchIndex = prevLogIndex
 				r.matchIndex[fid] = r.nextIndex[fid] - 1 // prevLogIndex
-				r.nextIndex[fid] = r.getLastIndex() + 1
+				// Set nextIndex = min(lastLogIndex + 1, max {index in newEntries} + 1)
+				r.nextIndex[fid] = min(r.getLastIndex()+1, r.nextIndex[fid]+maxLenNewEntries)
 			} else {
 				// Decrement nextIndex.
-				r.nextIndex[fid]--
+				r.logger.Debug("runLeader: set nextIndex = %d", reply.ConflictIndex)
+				r.nextIndex[fid] = reply.ConflictIndex
 			}
 			r.indexLock.Unlock()
 		case <-lc.appendEntriesTimerCh:

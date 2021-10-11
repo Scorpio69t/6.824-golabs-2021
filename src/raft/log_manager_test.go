@@ -44,7 +44,82 @@ func Test_logEntriesManager_Get(t *testing.T) {
 	}
 
 	_, err := lem.Get(4)
-	if err != ErrorOutOfRange {
+	if err != ErrorLogNotExist {
 		t.Fatal(err.Error())
+	}
+}
+
+func Test_logEntriesManager_FindFirstIndexByTerm(t *testing.T) {
+	// [0 1 1 1 2 2 3 3 3]
+	r := new(Raft)
+	r.initializeDefault()
+	r.persister = MakePersister()
+	lem := NewLogEntriesManager(r)
+	lem.PushLocal(&LogEntry{
+		Index:   1,
+		Term:    1,
+		Command: nil,
+	})
+	lem.PushLocal(&LogEntry{
+		Index:   2,
+		Term:    1,
+		Command: nil,
+	})
+	lem.PushLocal(&LogEntry{
+		Index:   3,
+		Term:    1,
+		Command: nil,
+	})
+	lem.PushLocal(&LogEntry{
+		Index:   4,
+		Term:    2,
+		Command: nil,
+	})
+	lem.PushLocal(&LogEntry{
+		Index:   5,
+		Term:    2,
+		Command: nil,
+	})
+	lem.PushLocal(&LogEntry{
+		Index:   6,
+		Term:    3,
+		Command: nil,
+	})
+	lem.PushLocal(&LogEntry{
+		Index:   7,
+		Term:    3,
+		Command: nil,
+	})
+	lem.PushLocal(&LogEntry{
+		Index:   8,
+		Term:    3,
+		Command: nil,
+	})
+	var firstIndex uint64
+	var err error
+
+	_, err = lem.FindFirstIndexByTerm(0)
+	if err == nil {
+		t.Fatal()
+	}
+
+	firstIndex, err = lem.FindFirstIndexByTerm(1)
+	if firstIndex != 1 || err != nil {
+		t.Fatal()
+	}
+
+	firstIndex, err = lem.FindFirstIndexByTerm(2)
+	if firstIndex != 4 || err != nil {
+		t.Fatal()
+	}
+
+	firstIndex, err = lem.FindFirstIndexByTerm(3)
+	if firstIndex != 6 || err != nil {
+		t.Fatal()
+	}
+
+	_, err = lem.FindFirstIndexByTerm(4)
+	if err == nil {
+		t.Fatal()
 	}
 }

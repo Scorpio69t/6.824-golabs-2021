@@ -34,7 +34,7 @@ func NewLogEntriesManager(r *Raft) (lem *logEntriesManager) {
 }
 
 var (
-	ErrorOutOfRange = errors.New("out of range")
+	ErrorLogNotExist = errors.New("log: not exist")
 )
 
 // PushLocal appends new log giving the command.
@@ -76,7 +76,7 @@ func (lem *logEntriesManager) GetLastLog() (log *LogEntry, err error) {
 // Get returns the log entry at index.
 func (lem *logEntriesManager) Get(index uint64) (log *LogEntry, err error) {
 	if index > lem.raftState.getLastIndex() {
-		err = ErrorOutOfRange
+		err = ErrorLogNotExist
 		return
 	}
 	lem.rwMutex.RLock()
@@ -116,4 +116,35 @@ func (lem *logEntriesManager) SetLogs(logs []*LogEntry) {
 	lem.rwMutex.Lock()
 	lem.logs = logs
 	lem.rwMutex.Unlock()
+}
+
+// FindFirstIndexByTerm returns the first index, so that logs[firstIndex] == term.
+// Assume that logs contain the entries whose term is the same as argument's, so we can find valid answer.
+func (lem *logEntriesManager) FindFirstIndexByTerm(term uint64) (firstIndex uint64, err error) {
+	lem.rwMutex.RLock()
+	// We use binary search to find the first index at which the logEntry.term == args.term, because terms is orderly.
+	firstIndex = lem.raftState.getLastIndex() + 1
+	change := false
+	left := uint64(1)
+	right := lem.raftState.getLastIndex()
+	for left <= right {
+		mid := left + (right - left) / 2
+		logEntry := lem.logs[mid]
+		if logEntry.Term == term {
+			if mid < firstIndex {
+				firstIndex = mid
+				change = true
+				right = mid - 1
+			}
+		} else if logEntry.Term < term {
+			left = mid + 1
+		} else {
+			right = mid - 1
+		}
+	}
+	lem.rwMutex.RUnlock()
+	if !change {
+		err = ErrorLogNotExist
+	}
+	return
 }
